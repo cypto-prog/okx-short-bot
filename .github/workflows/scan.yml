@@ -21,7 +21,6 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install requests ccxt pandas
-          pip install git+https://github.com/twopirllc/pandas-ta.git
 
       - name: 執行市場掃描
         run: python bot.py
