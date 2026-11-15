@@ -4,7 +4,6 @@ from datetime import datetime
 import requests
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 
 # ================= 參數設定 =================
 TELEGRAM_TOKEN = "916280041:AAHMmgcMylC2k7_SwyjD9gaPTztW6u2GQRo"
@@ -59,25 +58,40 @@ def get_top_liquid_altcoins(n=50):
 
 def analyze_symbol(symbol):
     try:
+        # 1. 檢查高週期 (15m) MACD 偏空走勢 (手動計算)
         df_15m = get_ohlcv(symbol, '15m', limit=100)
-        macd_15m = ta.macd(df_15m['close'])
-        if macd_15m['MACD_12_26_9'].iloc[-2] > 0:
+        if df_15m is None or len(df_15m) < 35:
+            return None
+        exp1 = df_15m['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df_15m['close'].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        macd_hist = macd - signal
+        
+        if macd_hist.iloc[-2] > 0:
+            return None  # 多頭，跳過
+            
+        # 2. 檢查 5m 週期指標
+        df_5m = get_ohlcv(symbol, '5m', limit=150)
+        if df_5m is None or len(df_5m) < 130:
             return None
             
-        df_5m = get_ohlcv(symbol, '5m', limit=100)
-        ema_7 = ta.ema(df_5m['close'], length=7)
-        ema_22 = ta.ema(df_5m['close'], length=22)
-        ema_85 = ta.ema(df_5m['close'], length=85)
-        ema_120 = ta.ema(df_5m['close'], length=120)
-        vol_ma = ta.sma(df_5m['volume'], length=20)
+        ema_7 = df_5m['close'].ewm(span=7, adjust=False).mean()
+        ema_22 = df_5m['close'].ewm(span=22, adjust=False).mean()
+        ema_85 = df_5m['close'].ewm(span=85, adjust=False).mean()
+        ema_120 = df_5m['close'].ewm(span=120, adjust=False).mean()
+        vol_ma = df_5m['volume'].rolling(window=20).mean()
         
+        # 3. 5m EMA 7/22 剛發生死叉
         is_dead_cross = (ema_7.iloc[-3] >= ema_22.iloc[-3]) and (ema_7.iloc[-2] < ema_22.iloc[-2])
         if not is_dead_cross:
             return None
             
+        # 4. 成交量過濾 (5m 量 > 20MA)
         if df_5m['volume'].iloc[-2] <= vol_ma.iloc[-2]:
             return None
             
+        # 5. 空間過濾 (價格距離大均線 > 1.2%)
         price = df_5m['close'].iloc[-2]
         base_ema = max(ema_85.iloc[-2], ema_120.iloc[-2])
         distance_pct = (base_ema - price) / price * 100
