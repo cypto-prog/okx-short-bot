@@ -1,27 +1,4 @@
-name: OKX Short Scanner
-
-on:
-  schedule:
-    - cron: '*/15 * * * *'  # 每 15 分鐘執行一次
-  workflow_dispatch:        # 允許手動點擊觸發
-
-jobs:
-  run-scanner:
-    runs-on: ubuntu-latest
-    steps:
-      - name: 下載程式碼
-        uses: actions/checkout@v4
-
-      - name: 設定 Python 環境
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 安裝必要套件
+- name: 安裝必要套件
         run: |
           pip install --upgrade pip
           pip install requests ccxt pandas
-          pip install git+https://github.com/twopirllc/pandas-ta.git
-
-      - name: 執行市場掃描
-        run: python bot.py
