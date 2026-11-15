@@ -4,7 +4,6 @@ from datetime import datetime
 import requests
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 
 # ================= 參數設定 =================
 TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
@@ -34,6 +33,14 @@ def get_ohlcv(symbol, timeframe, limit=150):
         return df
     except Exception:
         return None
+
+def calculate_macd(series, fast=12, slow=26, signal=9):
+    """純 Pandas 計算 MACD"""
+    exp1 = series.ewm(span=fast, adjust=False).mean()
+    exp2 = series.ewm(span=slow, adjust=False).mean()
+    macd_line = exp1 - exp2
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line - signal_line  # MACD Histogram / Line
 
 def get_top_liquid_altcoins(n=50):
     """自動撈取 24H 成交量最高的前 50 大高流動性山寨幣"""
@@ -65,13 +72,12 @@ def analyze_symbol(symbol):
         df_1h = get_ohlcv(symbol, '1h', limit=100)
         df_15m_a = get_ohlcv(symbol, '15m', limit=100)
         if df_1h is not None and df_15m_a is not None:
-            macd_1h = ta.macd(df_1h['close'])
-            ema_7_15 = ta.ema(df_15m_a['close'], length=7)
-            ema_22_15 = ta.ema(df_15m_a['close'], length=22)
-            vol_ma_15 = ta.sma(df_15m_a['volume'], length=20)
+            macd_1h = calculate_macd(df_1h['close'])
+            ema_7_15 = df_15m_a['close'].ewm(span=7, adjust=False).mean()
+            ema_22_15 = df_15m_a['close'].ewm(span=22, adjust=False).mean()
+            vol_ma_15 = df_15m_a['volume'].rolling(window=20).mean()
             
-            # 條件：1H MACD 偏空 且 15M 發生 EMA 7/22 死叉帶量
-            if macd_1h['MACD_12_26_9'].iloc[-2] < 0:
+            if macd_1h.iloc[-2] < 0:
                 is_dead_cross_15 = (ema_7_15.iloc[-3] >= ema_22_15.iloc[-3]) and (ema_7_15.iloc[-2] < ema_22_15.iloc[-2])
                 if is_dead_cross_15 and (df_15m_a['volume'].iloc[-2] > vol_ma_15.iloc[-2]):
                     price = df_15m_a['close'].iloc[-2]
@@ -87,13 +93,12 @@ def analyze_symbol(symbol):
         df_15m_b = get_ohlcv(symbol, '15m', limit=100)
         df_5m = get_ohlcv(symbol, '5m', limit=100)
         if df_15m_b is not None and df_5m is not None:
-            macd_15m = ta.macd(df_15m_b['close'])
-            ema_7_5 = ta.ema(df_5m['close'], length=7)
-            ema_22_5 = ta.ema(df_5m['close'], length=22)
-            vol_ma_5 = ta.sma(df_5m['volume'], length=20)
+            macd_15m = calculate_macd(df_15m_b['close'])
+            ema_7_5 = df_5m['close'].ewm(span=7, adjust=False).mean()
+            ema_22_5 = df_5m['close'].ewm(span=22, adjust=False).mean()
+            vol_ma_5 = df_5m['volume'].rolling(window=20).mean()
             
-            # 條件：15M MACD 偏空 且 5M 發生 EMA 7/22 死叉帶量
-            if macd_15m['MACD_12_26_9'].iloc[-2] < 0:
+            if macd_15m.iloc[-2] < 0:
                 is_dead_cross_5 = (ema_7_5.iloc[-3] >= ema_22_5.iloc[-3]) and (ema_7_5.iloc[-2] < ema_22_5.iloc[-2])
                 if is_dead_cross_5 and (df_5m['volume'].iloc[-2] > vol_ma_5.iloc[-2]):
                     price = df_5m['close'].iloc[-2]
@@ -110,7 +115,7 @@ def analyze_symbol(symbol):
         return None
 
 if __name__ == "__main__":
-    send_tg("🔔 <b>GitHub 雲端更新：已成功啟動「1H+15M」與「15M+5M」雙軌並行掃描！</b>")
+    send_tg("🔔 <b>GitHub 雲端更新：雙軌策略已切換為純 Pandas 核心，全面啟動！</b>")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 雙軌策略排程啟動...")
     coins = get_top_liquid_altcoins(50)
     found_count = 0
