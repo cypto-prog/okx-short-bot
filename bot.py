@@ -114,16 +114,30 @@ def analyze_symbol(symbol):
     except Exception:
         return None
 
+def main_loop():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 雙軌策略常駐機器人啟動...")
+    while True:
+        try:
+            start_time = datetime.now()
+            print(f"[{start_time.strftime('%H:%M:%S')}] 開始執行 50 大幣種掃描...")
+            
+            coins = get_top_liquid_altcoins(50)
+            found_count = 0
+            for sym in coins:
+                alert_msg = analyze_symbol(sym)
+                if alert_msg:
+                    send_tg(alert_msg)
+                    found_count += 1
+                    print(f"已發送通知：{sym}")
+                time.sleep(0.3)
+                
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 本輪掃描完畢，共發送 {found_count} 則通知。等待下一次循環...")
+            
+        except Exception as e:
+            print(f"發生錯誤: {e}")
+            
+        # 每隔 5 分鐘 (300秒) 自動執行下一輪
+        time.sleep(300)
+
 if __name__ == "__main__":
-    #send_tg("🔔 <b>GitHub 雲端更新：雙軌策略已切換為純 Pandas 核心，全面啟動！</b>")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 雙軌策略排程啟動...")
-    coins = get_top_liquid_altcoins(50)
-    found_count = 0
-    for sym in coins:
-        alert_msg = analyze_symbol(sym)
-        if alert_msg:
-            send_tg(alert_msg)
-            found_count += 1
-            print(f"已發送通知：{sym}")
-        time.sleep(0.3)
-    print(f"本輪雙軌掃描完畢，共發送 {found_count} 則通知。")
+    main_loop()
