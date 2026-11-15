@@ -1,9 +1,12 @@
+
 name: OKX Short Scanner
 
 on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [trigger_scan]
 
 jobs:
   run-scanner:
