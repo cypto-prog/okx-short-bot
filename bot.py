@@ -6,7 +6,7 @@ import ccxt
 import pandas as pd
 
 # ================= 參數設定 =================
-TELEGRAM_TOKEN = "916280041:AAHMmgcMylC2k7_SwyjD9gaPTztW6u2GQRo"
+TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
 CHAT_ID = "7686655302"
 
 def send_tg(message):
