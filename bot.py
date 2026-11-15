@@ -115,7 +115,7 @@ def analyze_symbol(symbol):
         return None
 
 if __name__ == "__main__":
-    send_tg("🔔 <b>GitHub 雲端更新：雙軌策略已切換為純 Pandas 核心，全面啟動！</b>")
+    #send_tg("🔔 <b>GitHub 雲端更新：雙軌策略已切換為純 Pandas 核心，全面啟動！</b>")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 雙軌策略排程啟動...")
     coins = get_top_liquid_altcoins(50)
     found_count = 0
