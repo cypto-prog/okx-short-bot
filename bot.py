@@ -42,6 +42,15 @@ def calculate_macd(series, fast=12, slow=26, signal=9):
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     return macd_line - signal_line
 
+def calculate_rsi(series, period):
+    """純 Pandas 計算指定週期的 RSI"""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
 def get_top_liquid_altcoins(n=50):
     """自動撈取 24H 成交量最高的前 50 大高流動性山寨幣"""
     try:
@@ -68,46 +77,59 @@ def analyze_symbol(symbol):
     try:
         coin_name = symbol.split('/')[0]
         
-        # ================= 策略 A：1H 搭配 15M (放寬版：只要死叉就報) =================
-        df_1h = get_ohlcv(symbol, '1h', limit=100)
-        df_15m_a = get_ohlcv(symbol, '15m', limit=100)
+        # ================= 策略 A：1H 搭配 15M (結合 RSI 3線過熱反轉) =================
+        df_1h = get_ohlcv(symbol, '1h', limit=150)
+        df_15m_a = get_ohlcv(symbol, '15m', limit=150)
         if df_1h is not None and df_15m_a is not None:
             macd_1h = calculate_macd(df_1h['close'])
-            ema_7_15 = df_15m_a['close'].ewm(span=7, adjust=False).mean()
-            ema_22_15 = df_15m_a['close'].ewm(span=22, adjust=False).mean()
             
-            # 放寬條件：只要 1H MACD 小於 0，且 15M 發生 EMA 死叉就抓出來
+            # 計算 15M 的 RSI 6, 12, 24
+            rsi_6 = calculate_rsi(df_15m_a['close'], 6)
+            rsi_12 = calculate_rsi(df_15m_a['close'], 12)
+            rsi_24 = calculate_rsi(df_15m_a['close'], 24)
+            
             if macd_1h.iloc[-2] < 0:
-                is_dead_cross_15 = (ema_7_15.iloc[-3] >= ema_22_15.iloc[-3]) and (ema_7_15.iloc[-2] < ema_22_15.iloc[-2])
-                if is_dead_cross_15:
+                # 條件：上一根或當下，3條 RSI 曾經全部 > 70 (超買區)
+                was_overbought = (rsi_6.iloc[-2] > 70) and (rsi_12.iloc[-2] > 70) and (rsi_24.iloc[-2] > 70)
+                
+                # 交叉條件：RSI 6 原本在上方，現在向下穿破 RSI 12 與 RSI 24
+                rsi_cross_down = (rsi_6.iloc[-3] >= rsi_12.iloc[-3]) and (rsi_6.iloc[-2] < rsi_12.iloc[-2])
+                
+                if was_overbought and rsi_cross_down:
                     price = df_15m_a['close'].iloc[-2]
+                    r6, r12, r24 = round(rsi_6.iloc[-2], 1), round(rsi_12.iloc[-2], 1), round(rsi_24.iloc[-2], 1)
                     return (
-                        f"📊 <b>[觀察區：1H + 15M 做空雷達]：{coin_name}</b>\n"
+                        f"🚨 <b>[1H+15M RSI 超買過熱反轉]：{coin_name}</b>\n"
                         f"• 現價：<code>{price}</code>\n"
-                        f"• 1H 大趨勢：MACD 偏空\n"
-                        f"• 15M 狀態：EMA 7/22 剛好死叉\n"
-                        f"• 提示：已放寬條件，請自行斟酌觀察"
+                        f"• RSI 狀態：三線曾超買 (>70) 且 6快線向下穿破\n"
+                        f"• 當前數值：RSI6({r6}) | RSI12({r12}) | RSI24({r24})\n"
+                        f"• 1H 大趨勢：MACD 偏空向下"
                     )
 
-        # ================= 策略 B：15M 搭配 5M (放寬版：短線高敏感) =================
-        df_15m_b = get_ohlcv(symbol, '15m', limit=100)
-        df_5m = get_ohlcv(symbol, '5m', limit=100)
+        # ================= 策略 B：15M 搭配 5M (結合 RSI 3線過熱反轉) =================
+        df_15m_b = get_ohlcv(symbol, '15m', limit=150)
+        df_5m = get_ohlcv(symbol, '5m', limit=150)
         if df_15m_b is not None and df_5m is not None:
             macd_15m = calculate_macd(df_15m_b['close'])
-            ema_7_5 = df_5m['close'].ewm(span=7, adjust=False).mean()
-            ema_22_5 = df_5m['close'].ewm(span=22, adjust=False).mean()
             
-            # 放寬條件：只要 15M MACD 小於 0，且 5M 發生 EMA 死叉就抓出來
+            # 計算 5M 的 RSI 6, 12, 24
+            rsi_6_5m = calculate_rsi(df_5m['close'], 6)
+            rsi_12_5m = calculate_rsi(df_5m['close'], 12)
+            rsi_24_5m = calculate_rsi(df_5m['close'], 24)
+            
             if macd_15m.iloc[-2] < 0:
-                is_dead_cross_5 = (ema_7_5.iloc[-3] >= ema_22_5.iloc[-3]) and (ema_7_5.iloc[-2] < ema_22_5.iloc[-2])
-                if is_dead_cross_5:
+                was_overbought_5m = (rsi_6_5m.iloc[-2] > 70) and (rsi_12_5m.iloc[-2] > 70) and (rsi_24_5m.iloc[-2] > 70)
+                rsi_cross_down_5m = (rsi_6_5m.iloc[-3] >= rsi_12_5m.iloc[-3]) and (rsi_6_5m.iloc[-2] < rsi_12_5m.iloc[-2])
+                
+                if was_overbought_5m and rsi_cross_down_5m:
                     price = df_5m['close'].iloc[-2]
+                    r6, r12, r24 = round(rsi_6_5m.iloc[-2], 1), round(rsi_12_5m.iloc[-2], 1), round(rsi_24_5m.iloc[-2], 1)
                     return (
-                        f"⚡ <b>[觀察區：15M + 5M 短線雷達]：{coin_name}</b>\n"
+                        f"⚡ <b>[15M+5M 短線 RSI 超買反轉]：{coin_name}</b>\n"
                         f"• 現價：<code>{price}</code>\n"
-                        f"• 15M 趨勢：MACD 偏空\n"
-                        f"• 5M 狀態：EMA 7/22 剛好死叉\n"
-                        f"• 提示：短線高敏感捕捉，請自行觀察"
+                        f"• RSI 狀態：三線曾超買 (>70) 且 6快線向下穿破\n"
+                        f"• 當前數值：RSI6({r6}) | RSI12({r12}) | RSI24({r24})\n"
+                        f"• 15M 趨勢：MACD 偏空向下"
                     )
 
         return None
@@ -115,7 +137,7 @@ def analyze_symbol(symbol):
         return None
 
 if __name__ == "__main__":
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 高敏感掃描開始...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] RSI 多維雷達掃描開始...")
     coins = get_top_liquid_altcoins(50)
     found_count = 0
     
@@ -124,7 +146,7 @@ if __name__ == "__main__":
         if alert_msg:
             send_tg(alert_msg)
             found_count += 1
-            print(f"發送觀察通知：{sym}")
+            print(f"發送 RSI 觀察通知：{sym}")
         time.sleep(0.3)
         
-    print(f"本輪掃描完畢。共發送 {found_count} 筆觀察訊號。")
+    print(f"本輪掃描完畢。共發送 {found_count} 筆 RSI 反轉訊號。")
