@@ -57,11 +57,10 @@ def check_market_scanner():
     symbols = [s for s in markets if s.endswith('/USDT:USDT') or s.endswith('/USDT')]
     target_symbols = symbols[:80] 
 
-    print(f"開始掃描共 {len(target_symbols)} 個幣種（雙時區獨立策略）...")
+    print(f"開始掃描共 {len(target_symbols)} 個幣種（優化均線發散區間）...")
 
     for symbol in target_symbols:
         try:
-            # 抓取 1h, 15m, 5m 資料
             ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
             ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
             ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
@@ -73,12 +72,10 @@ def check_market_scanner():
             if len(df_1h) < 30 or len(df_15m) < 30 or len(df_5m) < 30:
                 continue
 
-            # 計算各時區的 MACD
             m_1h, s_1h = calc_macd(df_1h['close'], 10, 20, 7)
             m_15m, s_15m = calc_macd(df_15m['close'], 10, 20, 7)
             m_5m, s_5m = calc_macd(df_5m['close'], 10, 20, 7)
 
-            # 判斷各時區大趨勢是否已死叉或正在死叉
             is_1h_bearish = m_1h.iloc[-2] < s_1h.iloc[-2]
             is_15m_bearish = m_15m.iloc[-2] < s_15m.iloc[-2]
 
@@ -104,23 +101,26 @@ def check_market_scanner():
                 macd_b_15 = m_15m.iloc[-2] < s_15m.iloc[-2]
                 rsi_ok_15 = df_15m['rsi'].iloc[-2] < 75
 
+                # 調整後的適度發散檢查（大於 0.05% 即符合，避免過度黏合但也不用拉太開）
+                ema_spread_15 = abs(e7_curr - e22_curr) / c15_close
+                not_too_flat_15 = ema_spread_15 >= 0.0005
+
                 r85 = (c15_close - df_15m['ema85'].iloc[-2]) / df_15m['ema85'].iloc[-2]
                 r120 = (c15_close - df_15m['ema120'].iloc[-2]) / df_15m['ema120'].iloc[-2]
                 room_ok_15 = (r85 >= 0.01) and (r120 >= 0.01)
 
-                if cross_15m and p_below_15 and macd_b_15 and rsi_ok_15 and room_ok_15:
+                if cross_15m and p_below_15 and macd_b_15 and rsi_ok_15 and room_ok_15 and not_too_flat_15:
                     atr_val = df_15m['atr'].iloc[-2]
-                    sl = c15_close + (atr_val * 1.0)
-                    tp = c15_close - (atr_val * 2.0)
+                    sl = c15_close + (atr_val * 1.1)
+                    tp = c15_close - (atr_val * 1.6)
                     
                     msg = (
                         f"🔵 **【OKX 空單訊號：1H + 15M 策略】** 🔵\n\n"
                         f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `1H 大趨勢過濾 + 15M 均線死叉進場`\n"
+                        f"📊 **時區組合**: `1H 大趨勢 + 15M 適度發散死叉`\n"
                         f"💰 **建議進場價**: `{c15_close}`\n"
-                        f"🛑 **建議停損 (1x ATR)**: `{sl:.4f}`\n"
-                        f"🎯 **建議止盈 (2x ATR)**: `{tp:.4f}`\n\n"
-                        f"⚡ *1H MACD 已經死叉，且 15M 剛發生 EMA 死叉！*"
+                        f"🛑 **建議停損 (1.1x ATR)**: `{sl:.4f}`\n"
+                        f"🎯 **建議止盈 (1.6x ATR)**: `{tp:.4f}`"
                     )
                     send_telegram_alert(msg)
 
@@ -146,23 +146,26 @@ def check_market_scanner():
                 macd_b_5 = m_5m.iloc[-2] < s_5m.iloc[-2]
                 rsi_ok_5 = df_5m['rsi'].iloc[-2] < 75
 
+                # 調整後的適度發散檢查（大於 0.05% 即符合）
+                ema_spread_5 = abs(e7_c5 - e22_c5) / c5_close
+                not_too_flat_5 = ema_spread_5 >= 0.0005
+
                 r85_5 = (c5_close - df_5m['ema85'].iloc[-2]) / df_5m['ema85'].iloc[-2]
                 r120_5 = (c5_close - df_5m['ema120'].iloc[-2]) / df_5m['ema120'].iloc[-2]
                 room_ok_5 = (r85_5 >= 0.01) and (r120_5 >= 0.01)
 
-                if cross_5m and p_below_5 and macd_b_5 and rsi_ok_5 and room_ok_5:
+                if cross_5m and p_below_5 and macd_b_5 and rsi_ok_5 and room_ok_5 and not_too_flat_5:
                     atr_val_5 = df_5m['atr'].iloc[-2]
-                    sl_5 = c5_close + (atr_val_5 * 1.0)
-                    tp_5 = c5_close - (atr_val_5 * 2.0)
+                    sl_5 = c5_close + (atr_val_5 * 1.1)
+                    tp_5 = c5_close - (atr_val_5 * 1.6)
                     
                     msg = (
                         f"🟢 **【OKX 空單訊號：15M + 5M 策略】** 🟢\n\n"
                         f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `15M 大趨勢過濾 + 5M 均線死叉進場`\n"
+                        f"📊 **時區組合**: `15M 大趨勢 + 5M 適度發散死叉`\n"
                         f"💰 **建議進場價**: `{c5_close}`\n"
-                        f"🛑 **建議停損 (1x ATR)**: `{sl_5:.4f}`\n"
-                        f"🎯 **建議止盈 (2x ATR)**: `{tp_5:.4f}`\n\n"
-                        f"⚡ *15M MACD 已經死叉，且 5M 剛發生 EMA 死叉！*"
+                        f"🛑 **建議停損 (1.1x ATR)**: `{sl_5:.4f}`\n"
+                        f"🎯 **建議止盈 (1.6x ATR)**: `{tp_5:.4f}`"
                     )
                     send_telegram_alert(msg)
 
