@@ -4,7 +4,7 @@ import pandas_ta as ta
 import requests
 import time
 
-# ===== Telegram 設定 (已自動幫你填入) =====
+# ===== Telegram 設定 (已帶入你的資訊) =====
 TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
 TELEGRAM_CHAT_ID = "7686655302"
 
