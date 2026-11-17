@@ -54,15 +54,32 @@ def calculate_indicators(df):
     return df
 
 def scan_market():
-    exchange = ccxt.okx()
+    exchange = ccxt.okx({
+        'options': {
+            'defaultType': 'swap',  # 設定預設抓取永續合約
+        }
+    })
+    
     try:
-        markets = exchange.load_markets()
+        exchange.load_markets()
     except Exception as e:
         print(f"載入 OKX 市場失敗: {e}")
         return
 
-    symbols = [symbol for symbol in markets if symbol.endswith('/USDT:USDT') or ('USDT' in symbol and symbol.endswith(':USDT'))]
-    print(f"開始掃描 OKX USDT 永續合約，總計 {len(symbols)} 個標的...")
+    # 取得所有 USDT 永續合約並依 24 小時成交量排序（成交量越大的通常也是主流與市值前段班）
+    tickers = exchange.fetch_tickers()
+    usdt_swaps = []
+    
+    for symbol, ticker in tickers.items():
+        if symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol):
+            quote_volume = ticker.get('quoteVolume', 0) or 0
+            usdt_swaps.append((symbol, quote_volume))
+
+    # 依照 24 小時成交量由大到小排序，取前 100 大流動性最佳的幣種
+    usdt_swaps.sort(key=lambda x: x[1], reverse=True)
+    symbols = [item[0] for item in usdt_swaps[:100]]
+
+    print(f"自動篩選出 OKX 成交量與市值前 100 大永續合約，開始掃描...")
 
     for symbol in symbols:
         try:
@@ -86,7 +103,6 @@ def scan_market():
             r_15m = df_15m.iloc[-2]
             r_5m = df_5m.iloc[-2]
             
-            # 取得前一根 K 線用來判斷 MACD 是否「剛轉向/準備死叉」
             r_15m_prev = df_15m.iloc[-3]
 
             # --- 策略一：1h 配合 15m ---
@@ -105,9 +121,7 @@ def scan_market():
                 (r_5m['RSI'] < 75)
             )
 
-            # --- 策略三（已調整）：15m 獨立自主觸發 ---
-            # 條件：15m 均線已經死叉 (EMA_7 < EMA_22) 
-            # 且 MACD 準備死叉（上一根 Hist >= 0 且這一根 Hist < 0）或已經死叉（MACD < MACD_Signal）
+            # --- 策略三：15m 獨立自主觸發 ---
             is_ema_dead_cross_15m = (r_15m['EMA_7'] < r_15m['EMA_22'])
             is_macd_cross_or_ready_15m = (
                 (r_15m['MACD'] < r_15m['MACD_Signal']) or 
