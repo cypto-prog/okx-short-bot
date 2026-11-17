@@ -57,7 +57,7 @@ def check_market_scanner():
     symbols = [s for s in markets if s.endswith('/USDT:USDT') or s.endswith('/USDT')]
     target_symbols = symbols[:80] 
 
-    print(f"開始掃描共 {len(target_symbols)} 個幣種（大趨勢前提 + 小時區 RSI黃線下穿策略）...")
+    print(f"開始掃描共 {len(target_symbols)} 個幣種（大趨勢前提 + RSI超買即可策略）...")
 
     for symbol in target_symbols:
         try:
@@ -104,11 +104,9 @@ def check_market_scanner():
                 p_below_15 = c15_close < e22_curr
                 macd_b_15 = m_15m.iloc[-2] < s_15m.iloc[-2]
 
+                # RSI 條件：只要近期曾進入超買區（>= 60）即可
                 rsi6_series_15 = df_15m['rsi6']
-                rsi12_series_15 = df_15m['rsi12']
-                was_overbought_15 = (rsi6_series_15.iloc[-6:-1] >= 60).any()
-                rsi6_down_15 = (rsi6_series_15.iloc[-3] >= rsi12_series_15.iloc[-3]) and (rsi6_series_15.iloc[-2] < rsi12_series_15.iloc[-2])
-                rsi_ok_15 = was_overbought_15 and rsi6_down_15
+                rsi_ok_15 = (rsi6_series_15.iloc[-6:-1] >= 60).any()
 
                 ema_spread_15 = abs(e7_curr - e22_curr) / c15_close
                 not_too_flat_15 = ema_spread_15 >= 0.0005
@@ -125,7 +123,7 @@ def check_market_scanner():
                     msg = (
                         f"🔵 **【OKX 空單訊號：1H + 15M 策略】** 🔵\n\n"
                         f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `1H趨勢前提 + 15M(RSI6黃線下穿)`\n"
+                        f"📊 **時區組合**: `1H趨勢前提 + 15M(RSI過熱即可)`\n"
                         f"💰 **建議進場價**: `{c15_close}`\n"
                         f"🛑 **建議停損 (1.1x ATR)**: `{sl:.4f}`\n"
                         f"🎯 **建議止盈 (1.6x ATR)**: `{tp:.4f}`"
@@ -156,11 +154,9 @@ def check_market_scanner():
                 p_below_5 = c5_close < e22_c5
                 macd_b_5 = m_5m.iloc[-2] < s_5m.iloc[-2]
 
+                # RSI 條件：只要近期曾進入超買區（>= 60）即可
                 rsi6_series_5 = df_5m['rsi6']
-                rsi12_series_5 = df_5m['rsi12']
-                was_overbought_5 = (rsi6_series_5.iloc[-6:-1] >= 60).any()
-                rsi6_down_5 = (rsi6_series_5.iloc[-3] >= rsi12_series_5.iloc[-3]) and (rsi6_series_5.iloc[-2] < rsi12_series_5.iloc[-2])
-                rsi_ok_5 = was_overbought_5 and rsi6_down_5
+                rsi_ok_5 = (rsi6_series_5.iloc[-6:-1] >= 60).any()
 
                 ema_spread_5 = abs(e7_c5 - e22_c5) / c5_close
                 not_too_flat_5 = ema_spread_5 >= 0.0005
@@ -177,7 +173,7 @@ def check_market_scanner():
                     msg = (
                         f"🟢 **【OKX 空單訊號：15M + 5M 策略】** 🟢\n\n"
                         f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `15M趨勢前提 + 5M(RSI6黃線下穿)`\n"
+                        f"📊 **時區組合**: `15M趨勢前提 + 5M(RSI過熱即可)`\n"
                         f"💰 **建議進場價**: `{c5_close}`\n"
                         f"🛑 **建議停損 (1.1x ATR)**: `{sl_5:.4f}`\n"
                         f"🎯 **建議止盈 (1.6x ATR)**: `{tp_5:.4f}`"
