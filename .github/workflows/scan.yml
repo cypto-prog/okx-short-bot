@@ -2,10 +2,10 @@ name: OKX Short Scanner / run-scanner
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
+    - cron: '*/5 * * * *'  # 內建每 5 分鐘定時鬧鐘
+  workflow_dispatch:        # 允許手動點擊觸發
   repository_dispatch:
-    types: [run-scanner]
+    types: [run-scanner]    # 允許外部 cron-job.org 透過 POST 請求觸發
 
 jobs:
   run-bot:
