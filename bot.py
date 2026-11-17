@@ -1,120 +1,146 @@
 import os
-import requests
 import ccxt
 import pandas as pd
-import time
+import requests
 
-# ================= 參數設定 =================
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-RSI_LIMIT = 75
-MIN_ROOM_PCT = 0.006       # 0.6% 最小下行空間
-MIN_SPREAD = 0.0006        # 均線最小發散幅度
-MIN_AWAY_PCT = 0.0005      # 距快線最小分離距離
-ATR_LEN = 14
-SL_MULT = 1.1              # 1.1x ATR 停損
-TP_MULT = 2.0              # 2.0x ATR 止盈
+# 1. 取得 Telegram 設定
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("未設定 Telegram 密鑰")
+        print("Telegram 密鑰未設定，略過發送。")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code == 200:
+            print("Telegram 通知發送成功！")
+        else:
+            print(f"Telegram 發送失敗: {response.text}")
     except Exception as e:
-        print(f"Telegram 發送失敗: {e}")
+        print(f"發送 Telegram 發生錯誤: {e}")
 
-def compute_indicators(df):
-    df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
-    df['ema22'] = df['close'].ewm(span=22, adjust=False).mean()
-    df['ema85'] = df['close'].ewm(span=85, adjust=False).mean()
-    df['ema120'] = df['close'].ewm(span=120, adjust=False).mean()
-    
-    exp1 = df['close'].ewm(span=10, adjust=False).mean()
-    exp2 = df['close'].ewm(span=20, adjust=False).mean()
-    df['macd'] = exp1 - exp2
-    df['macdsig'] = df['macd'].ewm(span=7, adjust=False).mean()
-    
+def calculate_indicators(df):
+    df['EMA_7'] = df['close'].ewm(span=7, adjust=False).mean()
+    df['EMA_22'] = df['close'].ewm(span=22, adjust=False).mean()
+    df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
+    df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
+
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+
     delta = df['close'].diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.ewm(com=5, adjust=False).mean()
-    avg_loss = loss.ewm(com=5, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift()).abs()
-    tr3 = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df['atr'] = tr.ewm(span=ATR_LEN, adjust=False).mean()
-    
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    df['ATR'] = true_range.rolling(window=14).mean()
+
     return df
 
-def main():
-    exchange = ccxt.okx({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+def scan_market():
+    exchange = ccxt.okx()
     try:
-        exchange.load_markets()
+        markets = exchange.load_markets()
     except Exception as e:
-        print(f"載入市場失敗: {e}")
+        print(f"載入 OKX 市場失敗: {e}")
         return
-        
-    # 只篩選 USDT 永續合約
-    symbols = [s for s in exchange.symbols if 'USDT:USDT' in s and not s.endswith(':USDT-22MAR24') and not s.endswith(':USDT-29JUN24')]
-    
-    print(f"開始掃描 {len(symbols)} 個永續合約標的...")
-    
-    for symbol in symbols[:30]:
-        try:
-            ohlcv_5m = exchange.fetch_ohlcv(symbol, '5m', limit=100)
-            ohlcv_15m = exchange.fetch_ohlcv(symbol, '15m', limit=50)
-            
-            if len(ohlcv_5m) < 50 or len(ohlcv_15m) < 30:
-                continue
-                
-            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            df_5m = compute_indicators(df_5m)
-            df_15m = compute_indicators(df_15m)
-            
-            df_15m['htf_bearish'] = df_15m['macd'] < df_15m['macdsig']
-            df_5m['datetime'] = pd.to_datetime(df_5m['timestamp'], unit='ms')
-            df_15m['datetime'] = pd.to_datetime(df_15m['timestamp'], unit='ms')
-            
-            df_5m = pd.merge_asof(df_5m, df_15m[['datetime', 'htf_bearish']], on='datetime', direction='backward')
-            
-            curr = df_5m.iloc[-1]
-            prev = df_5m.iloc[-2]
-            
-            htf_bearish = bool(curr.get('htf_bearish', False))
-            fast_ma, slow_ma = curr['ema7'], curr['ema22']
-            prev_fast, prev_slow = prev['ema7'], prev['ema22']
-            
-            crossover_bear = (prev_fast >= prev_slow) and (fast_ma < slow_ma)
-            close_price = curr['close']
-            macd_bear = curr['macd'] < curr['macdsig']
-            rsi_val = curr['rsi']
-            
-            has_room = (close_price - curr['ema85']) / curr['ema85'] >= MIN_ROOM_PCT and (close_price - curr['ema120']) / curr['ema120'] >= MIN_ROOM_PCT
-            not_too_flat = abs(fast_ma - slow_ma) / close_price >= MIN_SPREAD
-            price_away = (fast_ma - close_price) / close_price >= MIN_AWAY_PCT
-            
-            short_signal = htf_bearish and macd_bear and (rsi_val < RSI_LIMIT) and has_room and not_too_flat and price_away and crossover_bear and (close_price < slow_ma)
-            
-            if short_signal:
-                my_atr = curr['atr']
-                sl = close_price + (my_atr * SL_MULT)
-                tp = close_price - (my_atr * TP_MULT)
-                msg = f"🚨 *OKX 智慧短線空單訊號*\n\n標的: `{symbol}`\n價格: `{close_price}`\n停損 (SL): `{sl:.4f}`\n止盈 (TP): `{tp:.4f}`"
-                send_telegram_message(msg)
-                
-            time.sleep(exchange.rateLimit / 1000)
-        except Exception as e:
-            print(f"處理 {symbol} 時發生錯誤: {e}")
 
-if __name__ == '__main__':
-    main()
+    symbols = [symbol for symbol in markets if symbol.endswith('/USDT:USDT') or ('USDT' in symbol and symbol.endswith(':USDT'))]
+    print(f"開始掃描 OKX USDT 永續合約，總計 {len(symbols)} 個標的...")
+
+    for symbol in symbols:
+        try:
+            # 同步抓取 1h, 15m, 5m K線
+            ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
+            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_1h = calculate_indicators(df_1h)
+
+            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=150)
+            df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_15m = calculate_indicators(df_15m)
+
+            ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=150)
+            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_5m = calculate_indicators(df_5m)
+
+            if len(df_1h) < 5 or len(df_15m) < 5 or len(df_5m) < 5:
+                continue
+
+            r_1h = df_1h.iloc[-2]
+            r_15m = df_15m.iloc[-2]
+            r_5m = df_5m.iloc[-2]
+            
+            # 取得前一根 K 線用來判斷 MACD 是否「剛轉向/準備死叉」
+            r_15m_prev = df_15m.iloc[-3]
+
+            # --- 策略一：1h 配合 15m ---
+            track_1 = (
+                (r_1h['EMA_7'] < r_1h['EMA_22']) and 
+                (r_15m['EMA_7'] < r_15m['EMA_22']) and 
+                (r_15m['MACD_Hist'] < 0) and 
+                (r_15m['RSI'] < 75)
+            )
+
+            # --- 策略二：15m 配合 5m ---
+            track_2 = (
+                (r_15m['EMA_7'] < r_15m['EMA_22']) and 
+                (r_5m['EMA_7'] < r_5m['EMA_22']) and 
+                (r_5m['MACD_Hist'] < 0) and 
+                (r_5m['RSI'] < 75)
+            )
+
+            # --- 策略三（已調整）：15m 獨立自主觸發 ---
+            # 條件：15m 均線已經死叉 (EMA_7 < EMA_22) 
+            # 且 MACD 準備死叉（上一根 Hist >= 0 且這一根 Hist < 0）或已經死叉（MACD < MACD_Signal）
+            is_ema_dead_cross_15m = (r_15m['EMA_7'] < r_15m['EMA_22'])
+            is_macd_cross_or_ready_15m = (
+                (r_15m['MACD'] < r_15m['MACD_Signal']) or 
+                (r_15m_prev['MACD_Hist'] >= 0 and r_15m['MACD_Hist'] < 0)
+            )
+            track_3 = is_ema_dead_cross_15m and is_macd_cross_or_ready_15m
+
+            # 只要三種模式中任一成立就觸發
+            if track_1 or track_2 or track_3:
+                close_price = r_5m['close']
+                atr = r_5m['ATR']
+                stop_loss = close_price + (1.1 * atr)
+                take_profit = close_price - (1.6 * atr)
+
+                trigger_source = []
+                if track_1: trigger_source.append("1h+15m共振")
+                if track_2: trigger_source.append("15m+5m共振")
+                if track_3: trigger_source.append("15m獨立(均線死叉+MACD轉向)")
+
+                msg = (
+                    f"🚨 **OKX 智能空單訊號觸發** 🚨\n\n"
+                    f"📌 **標的**: `{symbol}`\n"
+                    f"⏰ **觸發來源**: `{', '.join(trigger_source)}`\n"
+                    f"💰 **建議進場價**: `{close_price}`\n"
+                    f"🛑 **建議止損 (SL)**: `{stop_loss:.4f}` (1.1x ATR)\n"
+                    f"🎯 **建議指盈 (TP)**: `{take_profit:.4f}` (1.6x ATR)\n"
+                    f"📊 **RSI (1h/15m/5m)**: `{r_1h['RSI']:.1f}` / `{r_15m['RSI']:.1f}` / `{r_5m['RSI']:.1f}`"
+                )
+                send_telegram_message(msg)
+                print(f"發現符合條件標的: {symbol} [{', '.join(trigger_source)}]")
+
+        except Exception as e:
+            print(f"處理標的 {symbol} 時發生錯誤: {e}")
+
+if __name__ == "__main__":
+    scan_market()
