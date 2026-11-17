@@ -1,99 +1,184 @@
-//@version=6
-indicator("雙週期 + RSI超買過熱確認 智慧短線空單策略", overlay=true)
+import ccxt
+import pandas as pd
+import requests
+import time
 
-// ===== 參數設定 =====
-mode = input.string("模式 A：15m + 5m", "週期模式", options=["模式 A：15m + 5m", "模式 B：1H + 15m"])
+# ===== Telegram 設定 =====
+TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
+TELEGRAM_CHAT_ID = "7686655302"
 
-rsiOverbought = input.float(60.0, "RSI6 超買過熱門檻 (>= 60)")
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Telegram 發送失敗: {e}")
 
-emaLongLen1 = input.int(85, "大級別長均線 1 (EMA 85)")
-emaLongLen2 = input.int(120, "大級別長均線 2 (EMA 120)")
-minRoomPct  = input.float(0.4, "最小下行空間百分比 (%)") / 100
+# ===== 自定義技術指標函數 =====
+def calc_ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
 
-// ===== ATR 動態止盈止損參數 =====
-atrLen = input.int(14, "ATR 週期")
-atrMultiplierSL = input.float(1.1, "停損 ATR 倍數 (SL)")
-atrMultiplierTP = input.float(1.6, "止盈 ATR 倍數 (TP)")
+def calc_macd(series, fast=10, slow=20, signal=7):
+    ema_fast = calc_ema(series, fast)
+    ema_slow = calc_ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = calc_ema(macd_line, signal)
+    return macd_line, signal_line
 
-higherTF = mode == "模式 A：15m + 5m" ? "15" : "60"
-lowerTF  = mode == "模式 A：15m + 5m" ? "5" : "15"
-correctTF = timeframe.period == lowerTF
+def calc_rsi(series, length):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=length - 1, min_periods=length).mean()
+    avg_loss = loss.ewm(com=length - 1, min_periods=length).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-// ===== 1. 本週期（小子級）指標計算 =====
-fastMA = ta.ema(close, 7)   // 黃線 (EMA 7)
-slowMA = ta.ema(close, 22)  // 藍線 (EMA 22)
+def calc_atr(df, length=14):
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.ewm(span=length, adjust=False).mean()
 
-ema85  = ta.ema(close, emaLongLen1)
-ema120 = ta.ema(close, emaLongLen2)
+def check_market_scanner():
+    exchange = ccxt.okx({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    })
+    
+    try:
+        markets = exchange.load_markets()
+    except Exception as e:
+        print(f"載入市場失敗: {e}")
+        return
 
-[m, s, h] = ta.macd(close, 10, 20, 7)
-rsiVal = ta.rsi(close, 6)
-myAtr = ta.atr(atrLen)
+    symbols = [s for s in markets if s.endswith('/USDT:USDT') or s.endswith('/USDT')]
+    target_symbols = symbols[:80] 
 
-// ===== 2. 高週期 (大級別) 背景跨週期抓取 =====
-[htf_m, htf_s, htf_h] = request.security(syminfo.tickerid, higherTF, ta.macd(close, 10, 20, 7), barmerge.gaps_off, barmerge.lookahead_off)
-htf_bearish = htf_m[1] < htf_s[1]
+    print(f"開始掃描共 {len(target_symbols)} 個幣種（大時區前20根超買背景 + 小時區死叉）...")
 
-// ===== 3. 條件判定 =====
-crossoverBear = ta.crossunder(fastMA, slowMA)
-priceBelow    = close < slowMA               
-macdBear      = m < s                        
+    for symbol in target_symbols:
+        try:
+            ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
+            ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
+            
+            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-// RSI 過熱條件：只要過去 6 根 K 線內 RSI 曾達到過超買門檻 (>=60) 即可
-wasOverbought = ta.highest(rsiVal, 6) >= rsiOverbought
-rsiValid      = wasOverbought
+            if len(df_1h) < 30 or len(df_15m) < 30 or len(df_5m) < 30:
+                continue
 
-roomToEma85   = (close - ema85) / ema85
-roomToEma120  = (close - ema120) / ema120
-hasEnoughRoom = (roomToEma85 >= minRoomPct) and (roomToEma120 >= minRoomPct)
+            # 計算大時區 RSI
+            df_1h['rsi6'] = calc_rsi(df_1h['close'], 6)
+            df_15m['rsi6'] = calc_rsi(df_15m['close'], 6)
 
-emaSpread     = math.abs(fastMA - slowMA) / close
-notTooFlat    = emaSpread >= 0.0003
+            m_1h, s_1h = calc_macd(df_1h['close'], 10, 20, 7)
+            m_15m, s_15m = calc_macd(df_15m['close'], 10, 20, 7)
+            m_5m, s_5m = calc_macd(df_5m['close'], 10, 20, 7)
 
-baseCondition = correctTF and htf_bearish and macdBear and rsiValid and hasEnoughRoom and notTooFlat
-nearCross     = baseCondition and (fastMA > slowMA) and ((fastMA - slowMA) / close < 0.0012) and (close < fastMA)
-shortSignal   = barstate.isconfirmed and baseCondition and crossoverBear and priceBelow
+            # 策略一的大時區條件 (1H): MACD死叉 + 前20根內RSI曾 >= 60
+            is_1h_bearish = m_1h.iloc[-2] < s_1h.iloc[-2]
+            h1_rsi_overbought = (df_1h['rsi6'].iloc[-21:-1] >= 60).any()
+            strat1_valid = is_1h_bearish and h1_rsi_overbought
 
-// ===== 4. 動態止盈止損計算與鎖定 =====
-var float entryPrice = na
-var float atrSL = na
-var float atrTP = na
+            # 策略二的大時區條件 (15M): MACD死叉 + 前20根內RSI曾 >= 60
+            is_15m_bearish = m_15m.iloc[-2] < s_15m.iloc[-2]
+            m15_rsi_overbought = (df_15m['rsi6'].iloc[-21:-1] >= 60).any()
+            strat2_valid = is_15m_bearish and m15_rsi_overbought
 
-if shortSignal
-    entryPrice := close
-    atrSL := close + (myAtr * atrMultiplierSL) 
-    atrTP := close - (myAtr * atrMultiplierTP) 
+            # ==========================================
+            # 策略組合一：1H（大趨勢+RSI背景） + 15M（進場點）
+            # ==========================================
+            if strat1_valid:
+                df_15m['ema7'] = calc_ema(df_15m['close'], 7)
+                df_15m['ema22'] = calc_ema(df_15m['close'], 22)
+                df_15m['ema85'] = calc_ema(df_15m['close'], 85)
+                df_15m['ema120'] = calc_ema(df_15m['close'], 120)
+                df_15m['atr'] = calc_atr(df_15m, 14)
 
-bool hitSL = not na(entryPrice) and close >= atrSL
-bool hitTP = not na(entryPrice) and close <= atrTP
+                c15_close = df_15m['close'].iloc[-2]
+                e7_curr = df_15m['ema7'].iloc[-2]
+                e7_prev = df_15m['ema7'].iloc[-3]
+                e22_curr = df_15m['ema22'].iloc[-2]
+                e22_prev = df_15m['ema22'].iloc[-3]
 
-if hitSL or hitTP
-    entryPrice := na
-    atrSL := na
-    atrTP := na
+                cross_15m = (e7_prev >= e22_prev) and (e7_curr < e22_curr)
+                p_below_15 = c15_close < e22_curr
+                macd_b_15 = m_15m.iloc[-2] < s_15m.iloc[-2]
 
-// ===== 5. 圖表繪製 =====
-plot(fastMA, "黃線 (EMA 7)", color=color.orange, linewidth=1)
-plot(slowMA, "藍線 (EMA 22)", color=color.blue, linewidth=1)
-plot(ema85,  "大級別 EMA 85", color=color.purple, linewidth=2)
-plot(ema120, "大級別 EMA 120", color=color.fuchsia, linewidth=2)
+                ema_spread_15 = abs(e7_curr - e22_curr) / c15_close
+                not_too_flat_15 = ema_spread_15 >= 0.0003
 
-plot(atrSL, "ATR 停損價 (SL)", color=color.red, style=plot.style_linebr, linewidth=2)
-plot(atrTP, "ATR 止盈價 (TP)", color=color.green, style=plot.style_linebr, linewidth=2)
+                r85 = (c15_close - df_15m['ema85'].iloc[-2]) / df_15m['ema85'].iloc[-2]
+                r120 = (c15_close - df_15m['ema120'].iloc[-2]) / df_15m['ema120'].iloc[-2]
+                room_ok_15 = (r85 >= 0.004) and (r120 >= 0.004)
 
-plotshape(shortSignal, title="SHORT", style=shape.labeldown, location=location.abovebar, color=color.red, text="SHORT", textcolor=color.white, size=size.small)
+                if cross_15m and p_below_15 and macd_b_15 and room_ok_15 and not_too_flat_15:
+                    atr_val = df_15m['atr'].iloc[-2]
+                    sl = c15_close + (atr_val * 1.1)
+                    tp = c15_close - (atr_val * 1.6)
+                    
+                    msg = (
+                        f"🔵 **【OKX 空單訊號：1H + 15M 策略】** 🔵\n\n"
+                        f"🔹 **幣種**: `{symbol}`\n"
+                        f"📊 **時區組合**: `1H(前20根超買背景) + 15M進場`\n"
+                        f"💰 **建議進場價**: `{c15_close}`\n"
+                        f"🛑 **建議停損 (1.1x ATR)**: `{sl:.4f}`\n"
+                        f"🎯 **建議止盈 (1.6x ATR)**: `{tp:.4f}`"
+                    )
+                    send_telegram_alert(msg)
 
-// ===== 6. 觸發即時警報 (Alert) =====
-if nearCross
-    alert("⚠️ 【即將死叉預警】目標幣種準備下穿，請盯緊盤面！", alert.freq_once_per_bar)
+            # ==========================================
+            # 策略組合二：15M（大趨勢+RSI背景） + 5M（進場點）
+            # ==========================================
+            if strat2_valid:
+                df_5m['ema7'] = calc_ema(df_5m['close'], 7)
+                df_5m['ema22'] = calc_ema(df_5m['close'], 22)
+                df_5m['ema85'] = calc_ema(df_5m['close'], 85)
+                df_5m['ema120'] = calc_ema(df_5m['close'], 120)
+                df_5m['atr'] = calc_atr(df_5m, 14)
 
-if shortSignal
-    alert("🚨 【SHORT 確認】大趨勢背景 + RSI超買過熱確認！", alert.freq_once_per_bar)
+                c5_close = df_5m['close'].iloc[-2]
+                e7_c5 = df_5m['ema7'].iloc[-2]
+                e7_p5 = df_5m['ema7'].iloc[-3]
+                e22_c5 = df_5m['ema22'].iloc[-2]
+                e22_p5 = df_5m['ema22'].iloc[-3]
 
-// ===== 7. 狀態檢核面板 =====
-var table panel = table.new(position.top_right, 1, 3)
-if barstate.islast
-    table.cell(panel, 0, 0, "智能預警策略 (RSI過熱確認版) ｜ " + mode, text_color=color.white, bgcolor=color.black)
-    string statusText = baseCondition ? "背景條件就緒(等待交叉)✓" : "條件未備齊(等待中)..."
-    table.cell(panel, 0, 1, statusText, text_color=color.white, bgcolor=baseCondition ? color.navy : color.maroon)
-    table.cell(panel, 0, 2, nearCross ? "⚠️ 即將死叉發生中！" : "監控中...", text_color=color.white, bgcolor=color.gray)
+                cross_5m = (e7_p5 >= e22_p5) and (e7_c5 < e22_c5)
+                p_below_5 = c5_close < e22_c5
+                macd_b_5 = m_5m.iloc[-2] < s_5m.iloc[-2]
+
+                ema_spread_5 = abs(e7_c5 - e22_c5) / c5_close
+                not_too_flat_5 = ema_spread_5 >= 0.0003
+
+                r85_5 = (c5_close - df_5m['ema85'].iloc[-2]) / df_5m['ema85'].iloc[-2]
+                r120_5 = (c5_close - df_5m['ema120'].iloc[-2]) / df_5m['ema120'].iloc[-2]
+                room_ok_5 = (r85_5 >= 0.004) and (r120_5 >= 0.004)
+
+                if cross_5m and p_below_5 and macd_b_5 and room_ok_5 and not_too_flat_5:
+                    atr_val_5 = df_5m['atr'].iloc[-2]
+                    sl_5 = c5_close + (atr_val_5 * 1.1)
+                    tp_5 = c5_close - (atr_val_5 * 1.6)
+                    
+                    msg = (
+                        f"🟢 **【OKX 空單訊號：15M + 5M 策略】** 🟢\n\n"
+                        f"🔹 **幣種**: `{symbol}`\n"
+                        f"📊 **時區組合**: `15M(前20根超買背景) + 5M進場`\n"
+                        f"💰 **建議進場價**: `{c5_close}`\n"
+                        f"🛑 **建議停損 (1.1x ATR)**: `{sl_5:.4f}`\n"
+                        f"🎯 **建議止盈 (1.6x ATR)**: `{tp_5:.4f}`"
+                    )
+                    send_telegram_alert(msg)
+
+            time.sleep(0.5)
+
+        except Exception as e:
+            print(f"處理 {symbol} 時發生錯誤: {e}")
+            continue
+
+if __name__ == "__main__":
+    check_market_scanner()
