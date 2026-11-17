@@ -57,7 +57,7 @@ def check_market_scanner():
     symbols = [s for s in markets if s.endswith('/USDT:USDT') or s.endswith('/USDT')]
     target_symbols = symbols[:80] 
 
-    print(f"開始掃描共 {len(target_symbols)} 個幣種（大時區前20根超買背景 + 小時區死叉）...")
+    print(f"開始掃描共 {len(target_symbols)} 個幣種（經典優化版：RSI75 + 0.6%空間 + 2xTP）...")
 
     for symbol in target_symbols:
         try:
@@ -72,32 +72,23 @@ def check_market_scanner():
             if len(df_1h) < 30 or len(df_15m) < 30 or len(df_5m) < 30:
                 continue
 
-            # 計算大時區 RSI
-            df_1h['rsi6'] = calc_rsi(df_1h['close'], 6)
-            df_15m['rsi6'] = calc_rsi(df_15m['close'], 6)
-
             m_1h, s_1h = calc_macd(df_1h['close'], 10, 20, 7)
             m_15m, s_15m = calc_macd(df_15m['close'], 10, 20, 7)
             m_5m, s_5m = calc_macd(df_5m['close'], 10, 20, 7)
 
-            # 策略一的大時區條件 (1H): MACD死叉 + 前20根內RSI曾 >= 60
+            # 大趨勢前提條件檢查
             is_1h_bearish = m_1h.iloc[-2] < s_1h.iloc[-2]
-            h1_rsi_overbought = (df_1h['rsi6'].iloc[-21:-1] >= 60).any()
-            strat1_valid = is_1h_bearish and h1_rsi_overbought
-
-            # 策略二的大時區條件 (15M): MACD死叉 + 前20根內RSI曾 >= 60
             is_15m_bearish = m_15m.iloc[-2] < s_15m.iloc[-2]
-            m15_rsi_overbought = (df_15m['rsi6'].iloc[-21:-1] >= 60).any()
-            strat2_valid = is_15m_bearish and m15_rsi_overbought
 
             # ==========================================
-            # 策略組合一：1H（大趨勢+RSI背景） + 15M（進場點）
+            # 策略組合一：1H（大趨勢前提） + 15M（進場點）
             # ==========================================
-            if strat1_valid:
+            if is_1h_bearish:
                 df_15m['ema7'] = calc_ema(df_15m['close'], 7)
                 df_15m['ema22'] = calc_ema(df_15m['close'], 22)
                 df_15m['ema85'] = calc_ema(df_15m['close'], 85)
                 df_15m['ema120'] = calc_ema(df_15m['close'], 120)
+                df_15m['rsi6'] = calc_rsi(df_15m['close'], 6)
                 df_15m['atr'] = calc_atr(df_15m, 14)
 
                 c15_close = df_15m['close'].iloc[-2]
@@ -109,37 +100,38 @@ def check_market_scanner():
                 cross_15m = (e7_prev >= e22_prev) and (e7_curr < e22_curr)
                 p_below_15 = c15_close < e22_curr
                 macd_b_15 = m_15m.iloc[-2] < s_15m.iloc[-2]
-
-                ema_spread_15 = abs(e7_curr - e22_curr) / c15_close
-                not_too_flat_15 = ema_spread_15 >= 0.0003
+                
+                # RSI 警戒值限制 (< 75)
+                rsi_ok_15 = df_15m['rsi6'].iloc[-2] < 75
 
                 r85 = (c15_close - df_15m['ema85'].iloc[-2]) / df_15m['ema85'].iloc[-2]
                 r120 = (c15_close - df_15m['ema120'].iloc[-2]) / df_15m['ema120'].iloc[-2]
-                room_ok_15 = (r85 >= 0.004) and (r120 >= 0.004)
+                room_ok_15 = (r85 >= 0.006) and (r120 >= 0.006) # 0.6% 空間
 
-                if cross_15m and p_below_15 and macd_b_15 and room_ok_15 and not_too_flat_15:
+                if cross_15m and p_below_15 and macd_b_15 and rsi_ok_15 and room_ok_15:
                     atr_val = df_15m['atr'].iloc[-2]
                     sl = c15_close + (atr_val * 1.1)
-                    tp = c15_close - (atr_val * 1.6)
+                    tp = c15_close - (atr_val * 2.0) # 2x TP
                     
                     msg = (
-                        f"🔵 **【OKX 空單訊號：1H + 15M 策略】** 🔵\n\n"
+                        f"🔵 **【OKX 空單訊號：1H + 15M 經典優化版】** 🔵\n\n"
                         f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `1H(前20根超買背景) + 15M進場`\n"
+                        f"📊 **時區組合**: `1H趨勢 + 15M進場`\n"
                         f"💰 **建議進場價**: `{c15_close}`\n"
                         f"🛑 **建議停損 (1.1x ATR)**: `{sl:.4f}`\n"
-                        f"🎯 **建議止盈 (1.6x ATR)**: `{tp:.4f}`"
+                        f"🎯 **建議止盈 (2.0x ATR)**: `{tp:.4f}`"
                     )
                     send_telegram_alert(msg)
 
             # ==========================================
-            # 策略組合二：15M（大趨勢+RSI背景） + 5M（進場點）
+            # 策略組合二：15M（大趨勢前提） + 5M（進場點）
             # ==========================================
-            if strat2_valid:
+            if is_15m_bearish:
                 df_5m['ema7'] = calc_ema(df_5m['close'], 7)
                 df_5m['ema22'] = calc_ema(df_5m['close'], 22)
                 df_5m['ema85'] = calc_ema(df_5m['close'], 85)
                 df_5m['ema120'] = calc_ema(df_5m['close'], 120)
+                df_5m['rsi6'] = calc_rsi(df_5m['close'], 6)
                 df_5m['atr'] = calc_atr(df_5m, 14)
 
                 c5_close = df_5m['close'].iloc[-2]
@@ -151,26 +143,26 @@ def check_market_scanner():
                 cross_5m = (e7_p5 >= e22_p5) and (e7_c5 < e22_c5)
                 p_below_5 = c5_close < e22_c5
                 macd_b_5 = m_5m.iloc[-2] < s_5m.iloc[-2]
-
-                ema_spread_5 = abs(e7_c5 - e22_c5) / c5_close
-                not_too_flat_5 = ema_spread_5 >= 0.0003
+                
+                # RSI 警戒值限制 (< 75)
+                rsi_ok_5 = df_5m['rsi6'].iloc[-2] < 75
 
                 r85_5 = (c5_close - df_5m['ema85'].iloc[-2]) / df_5m['ema85'].iloc[-2]
                 r120_5 = (c5_close - df_5m['ema120'].iloc[-2]) / df_5m['ema120'].iloc[-2]
-                room_ok_5 = (r85_5 >= 0.004) and (r120_5 >= 0.004)
+                room_ok_5 = (r85_5 >= 0.006) and (r120_5 >= 0.006) # 0.6% 空間
 
-                if cross_5m and p_below_5 and macd_b_5 and room_ok_5 and not_too_flat_5:
+                if cross_5m and p_below_5 and macd_b_5 and rsi_ok_5 and room_ok_5:
                     atr_val_5 = df_5m['atr'].iloc[-2]
                     sl_5 = c5_close + (atr_val_5 * 1.1)
-                    tp_5 = c5_close - (atr_val_5 * 1.6)
+                    tp_5 = c5_close - (atr_val_5 * 2.0) # 2x TP
                     
                     msg = (
-                        f"🟢 **【OKX 空單訊號：15M + 5M 策略】** 🟢\n\n"
+                        f"🟢 **【OKX 空單訊號：15M + 5M 經典優化版】** 🟢\n\n"
                         f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `15M(前20根超買背景) + 5M進場`\n"
+                        f"📊 **時區組合**: `15M趨勢 + 5M進場`\n"
                         f"💰 **建議進場價**: `{c5_close}`\n"
                         f"🛑 **建議停損 (1.1x ATR)**: `{sl_5:.4f}`\n"
-                        f"🎯 **建議止盈 (1.6x ATR)**: `{tp_5:.4f}`"
+                        f"🎯 **建議止盈 (2.0x ATR)**: `{tp_5:.4f}`"
                     )
                     send_telegram_alert(msg)
 
