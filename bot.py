@@ -1,176 +1,166 @@
+import os
 import ccxt
 import pandas as pd
+import pandas_ta as ta
 import requests
-import time
+from datetime import datetime
 
-# ===== Telegram 設定 =====
-TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
-TELEGRAM_CHAT_ID = "7686655302"
+# ================= 1. Telegram 通知設定 =================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram 憑證未設定，跳過通知。")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"Telegram 發送失敗: {response.text}")
     except Exception as e:
-        print(f"Telegram 發送失敗: {e}")
+        print(f"Telegram 連線錯誤: {e}")
 
-# ===== 自定義技術指標函數 =====
-def calc_ema(series, length):
-    return series.ewm(span=length, adjust=False).mean()
+# ================= 2. 初始化交易所與市場篩選 =================
+exchange = ccxt.okx({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'swap'}  # 預設使用永續合約
+})
 
-def calc_macd(series, fast=10, slow=20, signal=7):
-    ema_fast = calc_ema(series, fast)
-    ema_slow = calc_ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = calc_ema(macd_line, signal)
-    return macd_line, signal_line
+try:
+    exchange.load_markets()
+except Exception as e:
+    print(f"載入市場失敗: {e}")
+    exit(1)
 
-def calc_rsi(series, length):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=length - 1, min_periods=length).mean()
-    avg_loss = loss.ewm(com=length - 1, min_periods=length).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+# 篩選出所有 OKX 的 USDT 永續合約 (SWAP)，過濾掉純現貨
+symbols = []
+for symbol, market in exchange.markets.items():
+    if market.get('active', False) and market.get('quote') == 'USDT' and market.get('swap', False):
+        symbols.append(symbol)
 
-def calc_atr(df, length=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.ewm(span=length, adjust=False).mean()
+print(f"成功載入 {len(symbols)} 個 OKX USDT 永續合約標的。")
 
-def check_market_scanner():
-    exchange = ccxt.okx({
-        'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
-    })
-    
-    try:
-        markets = exchange.load_markets()
-    except Exception as e:
-        print(f"載入市場失敗: {e}")
-        return
+# ================= 3. 策略參數設定 =================
+TIMEFRAME_HIGHER = '15m'      # 大時區趨勢過濾
+TIMEFRAME_LOWER = '5m'     # 小時區進場觸發
+RSI_LIMIT = 75
+MIN_ROOM_PCT = 0.006       # 0.6% 最小下行空間
+MIN_SPREAD = 0.0006        # 均線最小發散幅度
+MIN_AWAY_PCT = 0.0005      # 距快線最小分離距離
+ATR_LEN = 14
+SL_MULT = 1.1
+TP_MULT = 2.0
 
-    symbols = [s for s in markets if s.endswith('/USDT:USDT') or s.endswith('/USDT')]
-    target_symbols = symbols[:80] 
-
-    print(f"開始掃描共 {len(target_symbols)} 個幣種（經典優化版：RSI75 + 0.6%空間 + 2xTP）...")
-
-    for symbol in target_symbols:
+# ================= 4. 掃描與運算邏輯 =================
+def analyze_market():
+    for symbol in symbols:
         try:
-            ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
-            ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
-            
-            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-            if len(df_1h) < 30 or len(df_15m) < 30 or len(df_5m) < 30:
+            # 抓取小時區數據 (5m)
+            ohlcv_lower = exchange.fetch_ohlcv(symbol, TIMEFRAME_LOWER, limit=100)
+            if len(ohlcv_lower) < 50:
                 continue
+            df_lower = pd.DataFrame(ohlcv_lower, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            # 抓取大時區數據 (15m)
+            ohlcv_higher = exchange.fetch_ohlcv(symbol, TIMEFRAME_HIGHER, limit=50)
+            if len(ohlcv_higher) < 30:
+                continue
+            df_higher = pd.DataFrame(ohlcv_higher, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-            m_1h, s_1h = calc_macd(df_1h['close'], 10, 20, 7)
-            m_15m, s_15m = calc_macd(df_15m['close'], 10, 20, 7)
-            m_5m, s_5m = calc_macd(df_5m['close'], 10, 20, 7)
+            # 計算技術指標
+            df_lower['ema7'] = ta.ema(df_lower['close'], length=7)
+            df_lower['ema22'] = ta.ema(df_lower['close'], length=22)
+            df_lower['ema85'] = ta.ema(df_lower['close'], length=85)
+            df_lower['ema120'] = ta.ema(df_lower['close'], length=120)
+            
+            macd_lower = ta.macd(df_lower['close'], fast=10, slow=20, signal=7)
+            df_lower['macd'] = macd_lower['MACD_10_20_7']
+            df_lower['macdsig'] = macd_lower['MACDs_10_20_7']
+            
+            df_lower['rsi'] = ta.rsi(df_lower['close'], length=6)
+            df_lower['atr'] = ta.atr(df_lower['high'], df_lower['low'], df_lower['close'], length=ATR_LEN)
 
-            # 大趨勢前提條件檢查
-            is_1h_bearish = m_1h.iloc[-2] < s_1h.iloc[-2]
-            is_15m_bearish = m_15m.iloc[-2] < s_15m.iloc[-2]
+            macd_higher = ta.macd(df_higher['close'], fast=10, slow=20, signal=7)
+            df_higher['macd'] = macd_higher['MACD_10_20_7']
+            df_higher['macdsig'] = macd_higher['MACDs_10_20_7']
 
-            # ==========================================
-            # 策略組合一：1H（大趨勢前提） + 15M（進場點）
-            # ==========================================
-            if is_1h_bearish:
-                df_15m['ema7'] = calc_ema(df_15m['close'], 7)
-                df_15m['ema22'] = calc_ema(df_15m['close'], 22)
-                df_15m['ema85'] = calc_ema(df_15m['close'], 85)
-                df_15m['ema120'] = calc_ema(df_15m['close'], 120)
-                df_15m['rsi6'] = calc_rsi(df_15m['close'], 6)
-                df_15m['atr'] = calc_atr(df_15m, 14)
+            c_idx = -2  # 取已確認收盤的那根 K 線
+            
+            htf_bearish = df_higher['macd'].iloc[c_idx] < df_higher['macdsig'].iloc[c_idx]
+            
+            fast_ma = df_lower['ema7'].iloc[c_idx]
+            slow_ma = df_lower['ema22'].iloc[c_idx]
+            prev_fast = df_lower['ema7'].iloc[c_idx - 1]
+            prev_slow = df_lower['ema22'].iloc[c_idx - 1]
+            
+            crossover_bear = (prev_fast >= prev_slow) and (fast_ma < slow_ma)
+            
+            close_price = df_lower['close'].iloc[c_idx]
+            macd_bear = df_lower['macd'].iloc[c_idx] < df_lower['macdsig'].iloc[c_idx]
+            rsi_val = df_lower['rsi'].iloc[c_idx]
+            
+            ema85 = df_lower['ema85'].iloc[c_idx]
+            ema120 = df_lower['ema120'].iloc[c_idx]
+            room_85 = (close_price - ema85) / ema85
+            room_120 = (close_price - ema120) / ema120
+            has_room = (room_85 >= MIN_ROOM_PCT) and (room_120 >= MIN_ROOM_PCT)
+            
+            ema_spread = abs(fast_ma - slow_ma) / close_price
+            not_too_flat = ema_spread >= MIN_SPREAD
+            price_away = (fast_ma - close_price) / close_price >= MIN_AWAY_PCT
+            
+            rsi_valid = rsi_val < RSI_LIMIT
+            price_below = close_price < slow_ma
 
-                c15_close = df_15m['close'].iloc[-2]
-                e7_curr = df_15m['ema7'].iloc[-2]
-                e7_prev = df_15m['ema7'].iloc[-3]
-                e22_curr = df_15m['ema22'].iloc[-2]
-                e22_prev = df_15m['ema22'].iloc[-3]
+            base_condition = htf_bearish and macd_bear and rsi_valid and has_room and not_too_flat and price_away
+            short_signal = base_condition and crossover_bear and price_below
 
-                cross_15m = (e7_prev >= e22_prev) and (e7_curr < e22_curr)
-                p_below_15 = c15_close < e22_curr
-                macd_b_15 = m_15m.iloc[-2] < s_15m.iloc[-2]
+            if short_signal:
+                # 取得當前訊號那根 K 線的時間戳記 (Timestamp)
+                current_bar_time = df_lower['timestamp'].iloc[c_idx]
                 
-                # RSI 警戒值限制 (< 75)
-                rsi_ok_15 = df_15m['rsi6'].iloc[-2] < 75
-
-                r85 = (c15_close - df_15m['ema85'].iloc[-2]) / df_15m['ema85'].iloc[-2]
-                r120 = (c15_close - df_15m['ema120'].iloc[-2]) / df_15m['ema120'].iloc[-2]
-                room_ok_15 = (r85 >= 0.006) and (r120 >= 0.006) # 0.6% 空間
-
-                if cross_15m and p_below_15 and macd_b_15 and rsi_ok_15 and room_ok_15:
-                    atr_val = df_15m['atr'].iloc[-2]
-                    sl = c15_close + (atr_val * 1.1)
-                    tp = c15_close - (atr_val * 2.0) # 2x TP
+                # 【防重複發送機制】檢查上一根 K 線或者記錄檔，確保同一個 K 線週期只發送一次
+                # 這裡我們可以用簡單的時間戳記比對，或者在每次發送後記錄。
+                # 為了最保險，我們確認「交叉發生的那一根 K 線」是否已經發送過。
+                # 實務上最簡單的方法：我們檢查這根 K 線的時間是不是剛好等於最近觸發的時間，
+                # 或者我們利用檔名/暫存來紀錄已發送過的 timestamp。
+                
+                signal_cache_file = f"cache_{symbol.replace('/', '_')}.txt"
+                last_sent_time = 0
+                if os.path.exists(signal_cache_file):
+                    with open(signal_cache_file, "r") as f:
+                        last_sent_time = int(f.read().strip() or 0)
+                
+                # 如果這根 K 線的時間戳記跟上次發送的不同，代表這是全新產生的交叉，才發送！
+                if current_bar_time != last_sent_time:
+                    my_atr = df_lower['atr'].iloc[c_idx]
+                    sl_price = close_price + (my_atr * SL_MULT)
+                    tp_price = close_price - (my_atr * TP_MULT)
                     
                     msg = (
-                        f"🔵 **【OKX 空單訊號：1H + 15M 經典優化版】** 🔵\n\n"
-                        f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `1H趨勢 + 15M進場`\n"
-                        f"💰 **建議進場價**: `{c15_close}`\n"
-                        f"🛑 **建議停損 (1.1x ATR)**: `{sl:.4f}`\n"
-                        f"🎯 **建議止盈 (2.0x ATR)**: `{tp:.4f}`"
+                        f"🚨 *[OKX 永續合約空單訊號]* 🚨\n\n"
+                        f"◆ 幣種: `{symbol}`\n"
+                        f"⏱ 時區組合: 15M 趨勢過濾 + 5M 均線死叉\n"
+                        f"💰 建議進場價: `{close_price:.4f}`\n"
+                        f"🛑 建議停損 (1.1x ATR): `{sl_price:.4f}`\n"
+                        f"🎯 建議止盈 (2.0x ATR): `{tp_price:.4f}`\n"
+                        f"⚡ 條件全數吻合，均線已死叉收盤！"
                     )
-                    send_telegram_alert(msg)
-
-            # ==========================================
-            # 策略組合二：15M（大趨勢前提） + 5M（進場點）
-            # ==========================================
-            if is_15m_bearish:
-                df_5m['ema7'] = calc_ema(df_5m['close'], 7)
-                df_5m['ema22'] = calc_ema(df_5m['close'], 22)
-                df_5m['ema85'] = calc_ema(df_5m['close'], 85)
-                df_5m['ema120'] = calc_ema(df_5m['close'], 120)
-                df_5m['rsi6'] = calc_rsi(df_5m['close'], 6)
-                df_5m['atr'] = calc_atr(df_5m, 14)
-
-                c5_close = df_5m['close'].iloc[-2]
-                e7_c5 = df_5m['ema7'].iloc[-2]
-                e7_p5 = df_5m['ema7'].iloc[-3]
-                e22_c5 = df_5m['ema22'].iloc[-2]
-                e22_p5 = df_5m['ema22'].iloc[-3]
-
-                cross_5m = (e7_p5 >= e22_p5) and (e7_c5 < e22_c5)
-                p_below_5 = c5_close < e22_c5
-                macd_b_5 = m_5m.iloc[-2] < s_5m.iloc[-2]
-                
-                # RSI 警戒值限制 (< 75)
-                rsi_ok_5 = df_5m['rsi6'].iloc[-2] < 75
-
-                r85_5 = (c5_close - df_5m['ema85'].iloc[-2]) / df_5m['ema85'].iloc[-2]
-                r120_5 = (c5_close - df_5m['ema120'].iloc[-2]) / df_5m['ema120'].iloc[-2]
-                room_ok_5 = (r85_5 >= 0.006) and (r120_5 >= 0.006) # 0.6% 空間
-
-                if cross_5m and p_below_5 and macd_b_5 and rsi_ok_5 and room_ok_5:
-                    atr_val_5 = df_5m['atr'].iloc[-2]
-                    sl_5 = c5_close + (atr_val_5 * 1.1)
-                    tp_5 = c5_close - (atr_val_5 * 2.0) # 2x TP
+                    send_telegram_message(msg)
+                    print(f"已發送 {symbol} 空單訊號通知。")
                     
-                    msg = (
-                        f"🟢 **【OKX 空單訊號：15M + 5M 經典優化版】** 🟢\n\n"
-                        f"🔹 **幣種**: `{symbol}`\n"
-                        f"📊 **時區組合**: `15M趨勢 + 5M進場`\n"
-                        f"💰 **建議進場價**: `{c5_close}`\n"
-                        f"🛑 **建議停損 (1.1x ATR)**: `{sl_5:.4f}`\n"
-                        f"🎯 **建議止盈 (2.0x ATR)**: `{tp_5:.4f}`"
-                    )
-                    send_telegram_alert(msg)
-
-            time.sleep(0.5)
+                    # 記錄這次發送的 K 線時間戳記，避免重複發送
+                    with open(signal_cache_file, "w") as f:
+                        f.write(str(current_bar_time))
+                else:
+                    print(f"{symbol} 在當前 K 線週期已經發送過訊號，略過重複推播。")
 
         except Exception as e:
-            print(f"處理 {symbol} 時發生錯誤: {e}")
             continue
 
 if __name__ == "__main__":
-    check_market_scanner()
+    print(f"[{datetime.now()}] 開始執行 OKX 永續合約市場掃描...")
+    analyze_market()
+    print(f"[{datetime.now()}] 掃描結束。")
