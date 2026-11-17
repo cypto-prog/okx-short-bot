@@ -2,7 +2,7 @@ name: OKX Short Scanner / run-scanner
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分鐘跑一次（依你的設定為主）
+    - cron: '*/5 * * * *'  # 每 5 分鐘跑一次
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,8 @@ jobs:
       - name: 安裝所需相依套件 (Install dependencies)
         run: |
           pip install --upgrade pip
-          pip install ccxt pandas pandas-ta requests
+          pip install ccxt pandas requests
+          pip install git+https://github.com/twopirllc/pandas-ta.git
 
       - name: 執行市場掃描機器人
         env:
