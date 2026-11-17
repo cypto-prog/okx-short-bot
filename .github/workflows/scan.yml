@@ -2,14 +2,16 @@ name: OKX Short Scanner / run-scanner
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分鐘跑一次
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+  repository_dispatch:
+    types: [run-scanner]
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     steps:
-      - name: 簽出程式碼 (Checkout repository)
+      - name: 簽出程式碼
         uses: actions/checkout@v3
 
       - name: 設定 Python 環境
@@ -17,12 +19,12 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安裝所需相依套件 (Install dependencies)
+      - name: 安裝相依套件
         run: |
           pip install --upgrade pip
           pip install ccxt pandas requests
 
-      - name: 執行市場掃描機器人
+      - name: 執行掃描機器人
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
