@@ -1,7 +1,6 @@
 import os
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import requests
 from datetime import datetime
 
@@ -34,7 +33,7 @@ except Exception as e:
     print(f"載入市場失敗: {e}")
     exit(1)
 
-# 篩選出所有 OKX 的 USDT 永續合約 (SWAP)，過濾掉純現貨
+# 篩選出所有 OKX 的 USDT 永續合約 (SWAP)
 symbols = []
 for symbol, market in exchange.markets.items():
     if market.get('active', False) and market.get('quote') == 'USDT' and market.get('swap', False):
@@ -43,50 +42,65 @@ for symbol, market in exchange.markets.items():
 print(f"成功載入 {len(symbols)} 個 OKX USDT 永續合約標的。")
 
 # ================= 3. 策略參數設定 =================
-TIMEFRAME_HIGHER = '15m'      # 大時區趨勢過濾
-TIMEFRAME_LOWER = '5m'     # 小時區進場觸發
+TIMEFRAME_HIGHER = '15m'
+TIMEFRAME_LOWER = '5m'
 RSI_LIMIT = 75
-MIN_ROOM_PCT = 0.006       # 0.6% 最小下行空間
-MIN_SPREAD = 0.0006        # 均線最小發散幅度
-MIN_AWAY_PCT = 0.0005      # 距快線最小分離距離
+MIN_ROOM_PCT = 0.006       
+MIN_SPREAD = 0.0006        
+MIN_AWAY_PCT = 0.0005      
 ATR_LEN = 14
 SL_MULT = 1.1
 TP_MULT = 2.0
 
-# ================= 4. 掃描與運算邏輯 =================
+# ================= 4. 純 Pandas 指標計算輔助函數 =================
+def compute_indicators(df):
+    # EMA
+    df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
+    df['ema22'] = df['close'].ewm(span=22, adjust=False).mean()
+    df['ema85'] = df['close'].ewm(span=85, adjust=False).mean()
+    df['ema120'] = df['close'].ewm(span=120, adjust=False).mean()
+    
+    # MACD (10, 20, 7)
+    exp1 = df['close'].ewm(span=10, adjust=False).mean()
+    exp2 = df['close'].ewm(span=20, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['macdsig'] = df['macd'].ewm(span=7, adjust=False).mean()
+    
+    # RSI (6)
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -1 * delta.clip(upper=0)
+    avg_gain = gain.ewm(com=5, adjust=False).mean()
+    avg_loss = loss.ewm(com=5, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # ATR (14)
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift()).abs()
+    tr3 = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['atr'] = tr.ewm(span=ATR_LEN, adjust=False).mean()
+    
+    return df
+
+# ================= 5. 掃描與運算邏輯 =================
 def analyze_market():
     for symbol in symbols:
         try:
-            # 抓取小時區數據 (5m)
             ohlcv_lower = exchange.fetch_ohlcv(symbol, TIMEFRAME_LOWER, limit=100)
             if len(ohlcv_lower) < 50:
                 continue
             df_lower = pd.DataFrame(ohlcv_lower, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_lower = compute_indicators(df_lower)
             
-            # 抓取大時區數據 (15m)
             ohlcv_higher = exchange.fetch_ohlcv(symbol, TIMEFRAME_HIGHER, limit=50)
             if len(ohlcv_higher) < 30:
                 continue
             df_higher = pd.DataFrame(ohlcv_higher, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_higher = compute_indicators(df_higher)
 
-            # 計算技術指標
-            df_lower['ema7'] = ta.ema(df_lower['close'], length=7)
-            df_lower['ema22'] = ta.ema(df_lower['close'], length=22)
-            df_lower['ema85'] = ta.ema(df_lower['close'], length=85)
-            df_lower['ema120'] = ta.ema(df_lower['close'], length=120)
-            
-            macd_lower = ta.macd(df_lower['close'], fast=10, slow=20, signal=7)
-            df_lower['macd'] = macd_lower['MACD_10_20_7']
-            df_lower['macdsig'] = macd_lower['MACDs_10_20_7']
-            
-            df_lower['rsi'] = ta.rsi(df_lower['close'], length=6)
-            df_lower['atr'] = ta.atr(df_lower['high'], df_lower['low'], df_lower['close'], length=ATR_LEN)
-
-            macd_higher = ta.macd(df_higher['close'], fast=10, slow=20, signal=7)
-            df_higher['macd'] = macd_higher['MACD_10_20_7']
-            df_higher['macdsig'] = macd_higher['MACDs_10_20_7']
-
-            c_idx = -2  # 取已確認收盤的那根 K 線
+            c_idx = -2  # 已確認收盤的那根 K 線
             
             htf_bearish = df_higher['macd'].iloc[c_idx] < df_higher['macdsig'].iloc[c_idx]
             
@@ -118,22 +132,13 @@ def analyze_market():
             short_signal = base_condition and crossover_bear and price_below
 
             if short_signal:
-                # 取得當前訊號那根 K 線的時間戳記 (Timestamp)
                 current_bar_time = df_lower['timestamp'].iloc[c_idx]
-                
-                # 【防重複發送機制】檢查上一根 K 線或者記錄檔，確保同一個 K 線週期只發送一次
-                # 這裡我們可以用簡單的時間戳記比對，或者在每次發送後記錄。
-                # 為了最保險，我們確認「交叉發生的那一根 K 線」是否已經發送過。
-                # 實務上最簡單的方法：我們檢查這根 K 線的時間是不是剛好等於最近觸發的時間，
-                # 或者我們利用檔名/暫存來紀錄已發送過的 timestamp。
-                
                 signal_cache_file = f"cache_{symbol.replace('/', '_')}.txt"
                 last_sent_time = 0
                 if os.path.exists(signal_cache_file):
                     with open(signal_cache_file, "r") as f:
                         last_sent_time = int(f.read().strip() or 0)
                 
-                # 如果這根 K 線的時間戳記跟上次發送的不同，代表這是全新產生的交叉，才發送！
                 if current_bar_time != last_sent_time:
                     my_atr = df_lower['atr'].iloc[c_idx]
                     sl_price = close_price + (my_atr * SL_MULT)
@@ -151,7 +156,6 @@ def analyze_market():
                     send_telegram_message(msg)
                     print(f"已發送 {symbol} 空單訊號通知。")
                     
-                    # 記錄這次發送的 K 線時間戳記，避免重複發送
                     with open(signal_cache_file, "w") as f:
                         f.write(str(current_bar_time))
                 else:
