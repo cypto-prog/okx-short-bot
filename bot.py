@@ -32,10 +32,11 @@ def calculate_indicators(df):
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    # MACD 參數已改為 10, 20, 7
+    exp1 = df['close'].ewm(span=10, adjust=False).mean()
+    exp2 = df['close'].ewm(span=20, adjust=False).mean()
     df['MACD'] = exp1 - exp2
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Signal'] = df['MACD'].ewm(span=7, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
 
     high_low = df['high'] - df['low']
@@ -72,7 +73,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print(f"開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉 空單策略】...")
+    print(f"開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉(10,20,7) 空單策略】...")
 
     for symbol in symbols:
         try:
