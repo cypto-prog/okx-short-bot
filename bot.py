@@ -54,7 +54,7 @@ def scan_market():
             'defaultType': 'swap',
         }
     })
-    
+
     try:
         exchange.load_markets()
     except Exception as e:
@@ -64,7 +64,7 @@ def scan_market():
     # 取得成交量前 100 大的主流幣種
     tickers = exchange.fetch_tickers()
     usdt_swaps = []
-    
+
     for symbol, ticker in tickers.items():
         if symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol):
             quote_volume = ticker.get('quoteVolume', 0) or 0
@@ -73,7 +73,8 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print("開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉(10,20,7) 空單策略（含5m獨立）】...")
+    print("開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉(10,20,7) 空單策略（5m獨立）】...")
+    triggered_count = 0
 
     for symbol in symbols:
         try:
@@ -100,37 +101,41 @@ def scan_market():
 
             # --- 策略一：1h 配合 15m ---
             track_1 = (
-                (r_1h['EMA_7'] < r_1h['EMA_22']) and 
-                (r_15m['EMA_7'] < r_15m['EMA_22']) and 
+                (r_1h['EMA_7'] < r_1h['EMA_22']) and
+                (r_15m['EMA_7'] < r_15m['EMA_22']) and
                 (r_15m['MACD_Hist'] < 0)
             )
 
-            # --- 策略二：5m 獨立自主觸發 (均線死叉 + MACD死叉/翻空) ---
-            is_ema_dead_cross_5m = (r_5m['EMA_7'] < r_5m['EMA_22'])
+            # --- 策略二：5m 獨立自主觸發 (均線空頭 + MACD死叉/翻空) ---
+            is_ema_bear_5m = (r_5m['EMA_7'] < r_5m['EMA_22'])
             is_macd_cross_or_ready_5m = (
-                (r_5m['MACD'] < r_5m['MACD_Signal']) or 
+                (r_5m['MACD'] < r_5m['MACD_Signal']) or
                 (r_5m_prev['MACD_Hist'] >= 0 and r_5m['MACD_Hist'] < 0)
             )
-            track_2 = is_ema_dead_cross_5m and is_macd_cross_or_ready_5m
+            track_2 = is_ema_bear_5m and is_macd_cross_or_ready_5m
 
-            # --- 策略三：15m 獨立自主觸發 (均線死叉 + MACD死叉/翻空) ---
-            is_ema_dead_cross_15m = (r_15m['EMA_7'] < r_15m['EMA_22'])
+            # --- 策略三：15m 獨立自主觸發 (均線空頭 + MACD死叉/翻空) ---
+            is_ema_bear_15m = (r_15m['EMA_7'] < r_15m['EMA_22'])
             is_macd_cross_or_ready_15m = (
-                (r_15m['MACD'] < r_15m['MACD_Signal']) or 
+                (r_15m['MACD'] < r_15m['MACD_Signal']) or
                 (r_15m_prev['MACD_Hist'] >= 0 and r_15m['MACD_Hist'] < 0)
             )
-            track_3 = is_ema_dead_cross_15m and is_macd_cross_or_ready_15m
+            track_3 = is_ema_bear_15m and is_macd_cross_or_ready_15m
 
             if track_1 or track_2 or track_3:
+                triggered_count += 1
                 close_price = r_5m['close']
                 atr = r_5m['ATR']
                 stop_loss = close_price + (1.1 * atr)
                 take_profit = close_price - (1.6 * atr)
 
                 trigger_source = []
-                if track_1: trigger_source.append("1h+15m共振(空)")
-                if track_2: trigger_source.append("5m獨立(均線死叉+MACD死叉)")
-                if track_3: trigger_source.append("15m獨立(均線死叉+MACD死叉)")
+                if track_1:
+                    trigger_source.append("1h+15m共振(空)")
+                if track_2:
+                    trigger_source.append("5m獨立(均線死叉+MACD死叉)")
+                if track_3:
+                    trigger_source.append("15m獨立(均線死叉+MACD死叉)")
 
                 msg = (
                     f"🚨 **OKX 智能空單訊號觸發** 🚨\n\n"
@@ -145,6 +150,8 @@ def scan_market():
 
         except Exception as e:
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
+
+    print(f"掃描完成，本輪共觸發 {triggered_count} 檔符合條件標的。")
 
 if __name__ == "__main__":
     scan_market()
