@@ -138,7 +138,6 @@ def get_downside_space_pct(bar):
     if not price or price <= 0 or pd.isna(ema_85) or pd.isna(ema_120):
         return None
 
-    # 取收盤價下方的均線作為支撐參考；若兩條都在下方，取較近的一條（較高值）作為最近阻力/支撐
     below_emas = [e for e in (ema_85, ema_120) if e < price]
     if not below_emas:
         return 0.0
@@ -215,19 +214,43 @@ def check_major_tf_setup(df):
 
 
 def check_minor_tf_setup(df):
-    """小/目標時區條件：EMA7、EMA22 在 EMA85、EMA120 上方，且出現死叉或收盤低於 EMA7/EMA22"""
-    if df is None or len(df) < 5:
+    """
+    目標/小週期條件：
+    1. EMA7、EMA22 在 EMA85、EMA120 上方
+    2. 死叉發生於剛收盤那根(-2) 或 前一根(-3)（即死叉當根或下一根皆可）
+    3. 剛收盤 K 棒(-2)收盤價低於 EMA7 與 EMA22（上下影線碰到不限制）
+    """
+    if df is None or len(df) < 6:
         return False, None
+
     curr = df.iloc[-2]
+    prev = df.iloc[-3]
+    prev2 = df.iloc[-4]
+
     if not is_ema7_22_above_85_120(curr):
         return False, None
 
-    in_dead_cross = curr['EMA_7'] < curr['EMA_22']
-    close_below_ema = (
-        curr['close'] < curr['EMA_7']
-        and curr['close'] < curr['EMA_22']
+    vals = [
+        curr['EMA_7'], curr['EMA_22'], curr['close'],
+        prev['EMA_7'], prev['EMA_22'],
+        prev2['EMA_7'], prev2['EMA_22'],
+    ]
+    if any(pd.isna(v) for v in vals):
+        return False, None
+
+    # 情況 A：剛收盤 K 棒(-2)當根發生死叉
+    cross_on_curr = (prev['EMA_7'] >= prev['EMA_22']) and (curr['EMA_7'] < curr['EMA_22'])
+
+    # 情況 B：前一根 K 棒(-3)發生死叉，剛收盤這根(-2)仍維持死叉狀態（下一根收在下面）
+    cross_on_prev = (
+        (prev2['EMA_7'] >= prev2['EMA_22'])
+        and (prev['EMA_7'] < prev['EMA_22'])
+        and (curr['EMA_7'] < curr['EMA_22'])
     )
-    return bool(in_dead_cross or close_below_ema), curr
+
+    close_below_cross = (curr['close'] < curr['EMA_7']) and (curr['close'] < curr['EMA_22'])
+
+    return bool((cross_on_curr or cross_on_prev) and close_below_cross), curr
 
 
 def fetch_tf_df(exchange, symbol, timeframe, limit=150):
@@ -243,7 +266,7 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=150):
 
 def scan_market():
     send_telegram_message(
-        f"🔔 OKX 三策略掃描器已啟動（前 50 大｜下方均線空間 >= {MIN_DOWNSIDE_SPACE_PCT}%）..."
+        f"🔔 OKX 三策略掃描器已啟動（前 50 大｜死叉當根或下一根收均線下・不限影線｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%）..."
     )
     sent_signatures = get_recent_sent_signatures(limit=100)
 
@@ -276,7 +299,7 @@ def scan_market():
 
     print(
         f"開始掃描 OKX 前 50 大合約【1H+15m / 15m+5m / 15m單獨｜"
-        f"EMA 7、22 > 85、120｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
+        f"死叉當根或下一根收均線下・不限影線｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
     )
 
     triggered_count = 0
@@ -299,7 +322,7 @@ def scan_market():
             ref_bar = None
             ref_space_pct = None
 
-            # 策略 1：1H 配合 15m（以 15m 進場K棒檢查下方大均線空間）
+            # 策略 1：1H 配合 15m
             if major_1h_ok and hit_15m and bar_15m is not None:
                 space_ok, space_pct = has_enough_downside_space(bar_15m)
                 if space_ok:
@@ -307,7 +330,7 @@ def scan_market():
                     ref_bar = bar_15m
                     ref_space_pct = space_pct
 
-            # 策略 2：15m 配合 5m（以 5m 進場K棒檢查下方大均線空間）
+            # 策略 2：15m 配合 5m
             if major_15m_ok and hit_5m and bar_5m is not None:
                 space_ok, space_pct = has_enough_downside_space(bar_5m)
                 if space_ok:
@@ -316,7 +339,7 @@ def scan_market():
                         ref_bar = bar_5m
                         ref_space_pct = space_pct
 
-            # 策略 3：15m 單獨（以 15m 進場K棒檢查下方大均線空間）
+            # 策略 3：15m 單獨
             if major_15m_ok and hit_15m and bar_15m is not None:
                 space_ok, space_pct = has_enough_downside_space(bar_15m)
                 if space_ok:
@@ -346,36 +369,3 @@ def scan_market():
                 take_profit = close_price - (1.6 * atr)
 
                 msg = (
-                    f"🚨 OKX 三策略掃描觸發 🚨\n\n"
-                    f"📌 標的: {symbol}\n"
-                    f"🎯 符合策略: {strat_label}\n"
-                    f"📐 均線結構: EMA 7、22 > EMA 85、120\n"
-                    f"📉 下方大均線空間: {ref_space_pct:.2f}%\n"
-                    f"💰 收盤價: {close_price}\n"
-                    f"🛑 建議止損 (SL): {stop_loss:.4f} (1.1x ATR)\n"
-                    f"🎯 建議指盈 (TP): {take_profit:.4f} (1.6x ATR)"
-                )
-
-                if send_telegram_message(msg):
-                    sent_signatures.add(signature)
-                print(f"發現符合標的: {symbol} [{strat_label}] 空間={ref_space_pct:.2f}%")
-
-            time.sleep(0.15)
-
-        except Exception as e:
-            error_count += 1
-            print(f"處理標的 {symbol} 時發生錯誤: {e}")
-
-    summary = (
-        f"✅ 本輪三策略掃描完成\n"
-        f"• 掃描標的數: {len(symbols)}\n"
-        f"• 新觸發通知數: {triggered_count}\n"
-        f"• 略過重複數: {skipped_dup_count}\n"
-        f"• 錯誤筆數: {error_count}"
-    )
-    print(summary)
-    send_telegram_message(summary)
-
-
-if __name__ == "__main__":
-    scan_market()
