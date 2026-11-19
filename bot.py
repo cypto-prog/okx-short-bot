@@ -7,6 +7,10 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# 可自行調整的 RSI 超買門檻
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -29,30 +33,22 @@ def send_telegram_message(message):
 
 
 def calculate_indicators(df):
-    # 均線組
     df['EMA_7'] = df['close'].ewm(span=7, adjust=False).mean()
     df['EMA_22'] = df['close'].ewm(span=22, adjust=False).mean()
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    # MACD (12, 26, 9)
-    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD_DIF'] = ema_12 - ema_26
-    df['MACD_DEA'] = df['MACD_DIF'].ewm(span=9, adjust=False).mean()
-    df['MACD_HIST'] = df['MACD_DIF'] - df['MACD_DEA']
-
-    # RSI (14)
+    # RSI 計算 (Wilder's smoothing / EWM)
     delta = df['close'].diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, float('nan'))
     df['RSI'] = 100 - (100 / (1 + rs))
     df['RSI'] = df['RSI'].fillna(100)
 
-    # ATR (14)
+    # ATR 用於風控停損止盈
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -63,47 +59,23 @@ def calculate_indicators(df):
     return df
 
 
-def is_bearish_base(df):
-    """單一時區基礎空方條件：7/22 EMA 死叉或處於死叉、收盤在雙均線下、MACD 偏空"""
+def check_timeframe_signal(df):
+    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生：快線下穿慢線 + K棒收在均線下方 + RSI超買"""
     if len(df) < 5:
-        return False
+        return False, None
+
     prev_bar = df.iloc[-3]
     curr_bar = df.iloc[-2]
 
-    dead_cross_state = curr_bar['EMA_7'] < curr_bar['EMA_22']
-    dead_cross_fresh = (prev_bar['EMA_7'] >= prev_bar['EMA_22']) and (curr_bar['EMA_7'] < curr_bar['EMA_22'])
+    # 1. 快線(EMA_7)下穿慢線(EMA_22)
+    dead_cross = (prev_bar['EMA_7'] >= prev_bar['EMA_22']) and (curr_bar['EMA_7'] < curr_bar['EMA_22'])
+    # 2. 剛收盤 K 棒收在均線下方
     close_below_ema = (curr_bar['close'] < curr_bar['EMA_7']) and (curr_bar['close'] < curr_bar['EMA_22'])
-    macd_bearish = (curr_bar['MACD_DIF'] < curr_bar['MACD_DEA']) or (curr_bar['MACD_HIST'] < 0)
+    # 3. RSI 超買
+    rsi_overbought = curr_bar['RSI'] > RSI_OVERBOUGHT
 
-    return (dead_cross_state or dead_cross_fresh) and close_below_ema and macd_bearish
-
-
-def evaluate_strategies(df_5m, df_15m, df_1h):
-    """評估三個策略：1) 1h配合15m  2) 15m配合5m  3) 15m獨立"""
-    triggered_strategies = []
-
-    bar_15m = df_15m.iloc[-2]
-    bar_5m = df_5m.iloc[-2]
-
-    # 策略 1：1h 配合 15m
-    if is_bearish_base(df_1h) and is_bearish_base(df_15m):
-        triggered_strategies.append(("策略1: 1h配合15m", bar_15m))
-
-    # 策略 2：15m 配合 5m
-    if is_bearish_base(df_15m) and is_bearish_base(df_5m):
-        triggered_strategies.append(("策略2: 15m配合5m", bar_5m))
-
-    # 策略 3：15m 獨立
-    prev_15m = df_15m.iloc[-3]
-    dead_cross_15m = (prev_15m['EMA_7'] >= prev_15m['EMA_22']) and (bar_15m['EMA_7'] < bar_15m['EMA_22'])
-    close_below_15m = (bar_15m['close'] < bar_15m['EMA_7']) and (bar_15m['close'] < bar_15m['EMA_22'])
-    macd_15m = (bar_15m['MACD_DIF'] < bar_15m['MACD_DEA']) or (bar_15m['MACD_HIST'] < 0)
-    rsi_ok_15m = bar_15m['RSI'] > 50
-
-    if dead_cross_15m and close_below_15m and macd_15m and rsi_ok_15m:
-        triggered_strategies.append(("策略3: 15m獨立", bar_15m))
-
-    return triggered_strategies
+    triggered = dead_cross and close_below_ema and rsi_overbought
+    return triggered, curr_bar
 
 
 def scan_market():
@@ -119,6 +91,7 @@ def scan_market():
         print(f"載入 OKX 市場失敗: {e}")
         return
 
+    # 取得成交量前 100 大的主流幣種
     tickers = exchange.fetch_tickers()
     usdt_swaps = []
 
@@ -130,7 +103,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print("開始掃描 OKX 前 100 大合約【1h配合15m / 15m配合5m / 15m獨立 | 均線+MACD+RSI】...")
+    print(f"開始掃描 OKX 前 100 大合約【5m / 15m / 1h 統一：死叉 + 收盤在均線下 + RSI>{RSI_OVERBOUGHT}】...")
     triggered_count = 0
 
     for symbol in symbols:
@@ -150,27 +123,47 @@ def scan_market():
                 pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             )
 
-            hits = evaluate_strategies(df_5m, df_15m, df_1h)
-            if hits:
+            hit_5m, bar_5m = check_timeframe_signal(df_5m)
+            hit_15m, bar_15m = check_timeframe_signal(df_15m)
+            hit_1h, bar_1h = check_timeframe_signal(df_1h)
+
+            matched_tfs = []
+            ref_bar = None
+            rsi_details = []
+
+            if hit_5m:
+                matched_tfs.append("5m")
+                ref_bar = bar_5m
+                rsi_details.append(f"5m RSI: {bar_5m['RSI']:.1f}")
+            if hit_15m:
+                matched_tfs.append("15m")
+                if ref_bar is None:
+                    ref_bar = bar_15m
+                rsi_details.append(f"15m RSI: {bar_15m['RSI']:.1f}")
+            if hit_1h:
+                matched_tfs.append("1h")
+                if ref_bar is None:
+                    ref_bar = bar_1h
+                rsi_details.append(f"1h RSI: {bar_1h['RSI']:.1f}")
+
+            if matched_tfs and ref_bar is not None:
                 triggered_count += 1
-                strategy_names = ", ".join([name for name, _ in hits])
-                ref_bar = hits[0][1]
                 close_price = ref_bar['close']
                 atr = ref_bar['ATR']
                 stop_loss = close_price + (1.1 * atr)
                 take_profit = close_price - (1.6 * atr)
 
                 msg = (
-                    f"🚨 **OKX 空方訊號觸發** 🚨\n\n"
+                    f"🚨 **OKX 死叉+收盤均線下+RSI超買 觸發** 🚨\n\n"
                     f"📌 **標的**: `{symbol}`\n"
-                    f"🧭 **符合策略**: `{strategy_names}`\n"
-                    f"📈 **15m RSI**: `{df_15m.iloc[-2]['RSI']:.1f}`\n"
-                    f"💰 **參考收盤價**: `{close_price}`\n"
+                    f"⏰ **觸發時區**: `{', '.join(matched_tfs)}`\n"
+                    f"📊 **超買數值**: `{', '.join(rsi_details)}`\n"
+                    f"💰 **收盤價**: `{close_price}`\n"
                     f"🛑 **建議止損 (SL)**: `{stop_loss:.4f}` (1.1x ATR)\n"
                     f"🎯 **建議指盈 (TP)**: `{take_profit:.4f}` (1.6x ATR)"
                 )
                 send_telegram_message(msg)
-                print(f"發現符合標的: {symbol} [{strategy_names}]")
+                print(f"發現符合標的: {symbol} [{', '.join(matched_tfs)}] ({', '.join(rsi_details)})")
 
         except Exception as e:
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
