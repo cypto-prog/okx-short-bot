@@ -65,19 +65,19 @@ def get_recent_sent_signatures(limit=100):
                 continue
 
             text = msg_obj.get("text", "")
-            if "OKX 死叉+收盤均線下 觸發" not in text:
+            if "OKX 三策略掃描觸發" not in text:
                 continue
 
             symbol_line = ""
-            tf_line = ""
+            strat_line = ""
             for line in text.splitlines():
                 if "標的:" in line:
                     symbol_line = line.split("標的:", 1)[1].strip()
-                elif "觸發時區:" in line:
-                    tf_line = line.split("觸發時區:", 1)[1].strip()
+                elif "符合策略:" in line:
+                    strat_line = line.split("符合策略:", 1)[1].strip()
 
-            if symbol_line and tf_line:
-                seen.add(f"{symbol_line}|{tf_line}")
+            if symbol_line and strat_line:
+                seen.add(f"{symbol_line}|{strat_line}")
 
     except Exception as e:
         print(f"讀取歷史訊號紀錄時略過錯誤: {e}")
@@ -91,6 +91,14 @@ def calculate_indicators(df):
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
+    # MACD (12, 26, 9)
+    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD_LINE'] = ema_12 - ema_26
+    df['MACD_SIGNAL'] = df['MACD_LINE'].ewm(span=9, adjust=False).mean()
+    df['MACD_HIST'] = df['MACD_LINE'] - df['MACD_SIGNAL']
+
+    # ATR (14)
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -102,21 +110,77 @@ def calculate_indicators(df):
     return df
 
 
-def check_timeframe_signal(df):
-    """檢查單一時區剛收盤 K 棒：處於死叉狀態 + 收盤價低於 EMA7 與 EMA22"""
+def is_macd_dead_or_imminent(df):
+    """判斷剛收盤 K 棒(-2)的 MACD 是否已死叉或即將死叉"""
+    if df is None or len(df) < 5:
+        return False
+
+    curr = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    if pd.isna(curr['MACD_HIST']) or pd.isna(prev['MACD_HIST']):
+        return False
+
+    # 1. 已死叉：MACD 線低於 Signal 線（柱狀圖 < 0）
+    already_dead = curr['MACD_LINE'] < curr['MACD_SIGNAL']
+
+    # 2. 即將死叉：柱狀圖仍在正值但快速收斂（小於前一根 50% 且柱狀圖下降）
+    imminent_dead = (
+        curr['MACD_HIST'] > 0
+        and prev['MACD_HIST'] > 0
+        and curr['MACD_HIST'] < prev['MACD_HIST'] * 0.5
+    )
+
+    return bool(already_dead or imminent_dead)
+
+
+def is_ema_dead_or_imminent(df):
+    """判斷剛收盤 K 棒(-2)的 EMA7 / EMA22 是否已死叉或即將死叉"""
+    if df is None or len(df) < 5:
+        return False
+
+    curr = df.iloc[-2]
+    prev = df.iloc[-3]
+    price = curr['close']
+    if not price or price <= 0:
+        return False
+
+    # 1. 已死叉：EMA7 < EMA22
+    already_dead = curr['EMA_7'] < curr['EMA_22']
+
+    # 2. 即將死叉：EMA7 仍在 EMA22 之上或貼近，但差距縮小且距離收斂在 0.15% 內
+    curr_gap = curr['EMA_7'] - curr['EMA_22']
+    prev_gap = prev['EMA_7'] - prev['EMA_22']
+    gap_pct = abs(curr_gap) / price * 100
+
+    imminent_dead = (
+        curr_gap >= 0
+        and curr_gap < prev_gap
+        and gap_pct <= 0.15
+    )
+
+    return bool(already_dead or imminent_dead)
+
+
+def check_dead_cross_below_ema(df):
+    """檢查小週期剛收盤 K 棒：處於死叉狀態 (EMA7 < EMA22) 且收盤低於 EMA7 與 EMA22"""
     if df is None or len(df) < 5:
         return False, None
 
     curr_bar = df.iloc[-2]
-
     in_dead_cross = curr_bar['EMA_7'] < curr_bar['EMA_22']
     close_below_ema = (
         curr_bar['close'] < curr_bar['EMA_7']
         and curr_bar['close'] < curr_bar['EMA_22']
     )
+    return bool(in_dead_cross and close_below_ema), curr_bar
 
-    triggered = bool(in_dead_cross and close_below_ema)
-    return triggered, curr_bar
+
+def check_major_tf_bearish_setup(df):
+    """大時區嚴格條件：MACD 即將/已死叉 且 EMA7/22 即將/已死叉"""
+    if df is None or len(df) < 5:
+        return False
+    return bool(is_macd_dead_or_imminent(df) and is_ema_dead_or_imminent(df))
 
 
 def fetch_tf_df(exchange, symbol, timeframe, limit=150):
@@ -131,7 +195,7 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=150):
 
 
 def scan_market():
-    send_telegram_message("🔔 OKX 掃描器已啟動，開始檢查前 100 大 USDT 永續合約...")
+    send_telegram_message("🔔 OKX 三策略（大時區雙死叉/準死叉加嚴版）掃描器已啟動...")
     sent_signatures = get_recent_sent_signatures(limit=100)
 
     exchange = ccxt.okx({
@@ -161,7 +225,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print("開始掃描 OKX 前 100 大合約【5m / 15m / 1h：死叉狀態 + 收盤在均線下】...")
+    print("開始掃描 OKX 前 100 大合約【大時區 MACD+均線 即將/已死叉 加嚴版】...")
 
     triggered_count = 0
     skipped_dup_count = 0
@@ -169,32 +233,37 @@ def scan_market():
 
     for symbol in symbols:
         try:
-            df_5m = fetch_tf_df(exchange, symbol, '5m', limit=150)
-            df_15m = fetch_tf_df(exchange, symbol, '15m', limit=150)
             df_1h = fetch_tf_df(exchange, symbol, '1h', limit=150)
+            df_15m = fetch_tf_df(exchange, symbol, '15m', limit=150)
+            df_5m = fetch_tf_df(exchange, symbol, '5m', limit=150)
 
-            hit_5m, bar_5m = check_timeframe_signal(df_5m)
-            hit_15m, bar_15m = check_timeframe_signal(df_15m)
-            hit_1h, bar_1h = check_timeframe_signal(df_1h)
+            major_1h_ok = check_major_tf_bearish_setup(df_1h)
+            major_15m_ok = check_major_tf_bearish_setup(df_15m)
 
-            matched_tfs = []
+            hit_15m, bar_15m = check_dead_cross_below_ema(df_15m)
+            hit_5m, bar_5m = check_dead_cross_below_ema(df_5m)
+
+            matched_strategies = []
             ref_bar = None
 
-            if hit_5m:
-                matched_tfs.append("5m")
-                ref_bar = bar_5m
+            # 策略 1：1H 配合 15m（1H 大時區 MACD + 均線 即將/已死叉）
+            if major_1h_ok and hit_15m and bar_15m is not None:
+                matched_strategies.append("1H+15m")
+                ref_bar = bar_15m
 
-            if hit_15m:
-                matched_tfs.append("15m")
+            # 策略 2：15m 配合 5m（15m 大時區 MACD + 均線 即將/已死叉）
+            if major_15m_ok and hit_5m and bar_5m is not None:
+                matched_strategies.append("15m+5m")
+                if ref_bar is None:
+                    ref_bar = bar_5m
+
+            # 策略 3：15m 單獨（15m MACD + 均線 即將/已死叉 且收盤低於 EMA7/22）
+            if major_15m_ok and hit_15m and bar_15m is not None:
+                matched_strategies.append("15m單獨")
                 if ref_bar is None:
                     ref_bar = bar_15m
 
-            if hit_1h:
-                matched_tfs.append("1h")
-                if ref_bar is None:
-                    ref_bar = bar_1h
-
-            if matched_tfs and ref_bar is not None:
+            if matched_strategies and ref_bar is not None:
                 close_price = ref_bar['close']
                 atr = ref_bar['ATR']
 
@@ -202,12 +271,12 @@ def scan_market():
                     print(f"{symbol} ATR 資料不足，略過風控價格計算。")
                     continue
 
-                tf_label = ', '.join(matched_tfs)
-                signature = f"{symbol}|{tf_label}"
+                strat_label = ', '.join(matched_strategies)
+                signature = f"{symbol}|{strat_label}"
 
                 if signature in sent_signatures:
                     skipped_dup_count += 1
-                    print(f"略過重複訊號: {symbol} [{tf_label}]")
+                    print(f"略過重複訊號: {symbol} [{strat_label}]")
                     continue
 
                 triggered_count += 1
@@ -215,9 +284,9 @@ def scan_market():
                 take_profit = close_price - (1.6 * atr)
 
                 msg = (
-                    f"🚨 OKX 死叉+收盤均線下 觸發 🚨\n\n"
+                    f"🚨 OKX 三策略掃描觸發 🚨\n\n"
                     f"📌 標的: {symbol}\n"
-                    f"⏰ 觸發時區: {tf_label}\n"
+                    f"🎯 符合策略: {strat_label}\n"
                     f"💰 收盤價: {close_price}\n"
                     f"🛑 建議止損 (SL): {stop_loss:.4f} (1.1x ATR)\n"
                     f"🎯 建議指盈 (TP): {take_profit:.4f} (1.6x ATR)"
@@ -225,7 +294,7 @@ def scan_market():
 
                 if send_telegram_message(msg):
                     sent_signatures.add(signature)
-                print(f"發現符合標的: {symbol} [{tf_label}]")
+                print(f"發現符合標的: {symbol} [{strat_label}]")
 
             time.sleep(0.15)
 
@@ -234,7 +303,7 @@ def scan_market():
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
 
     summary = (
-        f"✅ 本輪掃描完成\n"
+        f"✅ 本輪三策略掃描完成\n"
         f"• 掃描標的數: {len(symbols)}\n"
         f"• 新觸發通知數: {triggered_count}\n"
         f"• 略過重複數: {skipped_dup_count}\n"
@@ -246,4 +315,3 @@ def scan_market():
 
 if __name__ == "__main__":
     scan_market()
-    
