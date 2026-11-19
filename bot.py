@@ -1,6 +1,5 @@
-import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 import ccxt
 import pandas as pd
@@ -8,8 +7,6 @@ import pandas as pd
 # ================= 參數設定 =================
 TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
 CHAT_ID = "7686655302"
-REPORT_RECORD_FILE = "last_report.txt"  # 記錄上次 10 天定期通知的時間檔
-REPORT_DAYS = 10                        # 設定每幾天發送一次定期通知
 
 def send_tg(message):
     """發送 Telegram 通知"""
@@ -23,38 +20,6 @@ def send_tg(message):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram 發送失敗: {e}")
-
-def check_and_send_periodic_report():
-    """檢查是否滿 10 天，若滿了則發送定期通知並更新記錄"""
-    now = datetime.now()
-    last_time = None
-    
-    # 讀取上次發送的時間
-    if os.path.exists(REPORT_RECORD_FILE):
-        try:
-            with open(REPORT_RECORD_FILE, "r") as f:
-                content = f.read().strip()
-                if content:
-                    last_time = datetime.fromisoformat(content)
-        except Exception as e:
-            print(f"讀取定期通知記錄失敗: {e}")
-            
-    # 如果從未發送過，或者距離上次已超過或等於設定的天數
-    if last_time is None or (now - last_time) >= timedelta(days=REPORT_DAYS):
-        report_msg = (
-            f"🟢 <b>[OKX 機器人定期回報]</b>\n"
-            f"• 狀態：運行中（健康）\n"
-            f"• 說明：已順利自動運作滿 {REPORT_DAYS} 天，雲端排程一切正常！"
-        )
-        send_tg(report_msg)
-        print("已發送每 10 天的定期存活通知。")
-        
-        # 寫入最新的發送時間
-        try:
-            with open(REPORT_RECORD_FILE, "w") as f:
-                f.write(now.isoformat())
-        except Exception as e:
-            print(f"寫入定期通知記錄失敗: {e}")
 
 # 初始化交易所
 exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
@@ -151,10 +116,6 @@ def analyze_symbol(symbol):
 if __name__ == "__main__":
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 雙軌策略背景掃描開始...")
     
-    # 1. 檢查並執行每 10 天的定期存活通知
-    check_and_send_periodic_report()
-    
-    # 2. 執行原本的市場掃描與訊號發送
     coins = get_top_liquid_altcoins(50)
     found_count = 0
     
