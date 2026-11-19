@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime
 import requests
@@ -5,11 +6,18 @@ import ccxt
 import pandas as pd
 
 # ================= 參數設定 =================
-TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
-CHAT_ID = "7686655302"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "7686655302"
+
+TIMEFRAMES = ["5m", "15m", "1h"]
+TOP_N = 100
+
 
 def send_tg(message):
     """發送 Telegram 通知"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Telegram 設定不完整，略過發送。")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -17,114 +25,91 @@ def send_tg(message):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            print("Telegram 通知發送成功。")
+        else:
+            print(f"Telegram 發送失敗 ({resp.status_code}): {resp.text}")
     except Exception as e:
         print(f"Telegram 發送失敗: {e}")
 
-# 初始化交易所
+
 exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
+
 
 def get_ohlcv(symbol, timeframe, limit=150):
     """取得 K 線數據"""
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        if not bars:
+            return None
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
     except Exception:
         return None
 
-def calculate_macd(series, fast=12, slow=26, signal=9):
-    """純 Pandas 計算 MACD"""
-    exp1 = series.ewm(span=fast, adjust=False).mean()
-    exp2 = series.ewm(span=slow, adjust=False).mean()
-    macd_line = exp1 - exp2
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line - signal_line  # MACD Histogram / Line
 
-def get_top_liquid_altcoins(n=50):
-    """自動撈取 24H 成交量最高的前 50 大高流動性山寨幣"""
+def get_top_usdt_swaps(n=100):
+    """撈取成交量前 N 大 USDT 永續合約"""
     try:
+        exchange.load_markets()
         tickers = exchange.fetch_tickers()
-        stable_coins = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'USDC/USDT:USDT']
-        
         usdt_pairs = []
         for symbol, ticker in tickers.items():
-            if not symbol.endswith('/USDT:USDT'):
-                continue
-            if symbol in stable_coins:
-                continue
-            vol = ticker.get('quoteVolume', 0)
-            if vol > 10000000:
+            if symbol.endswith('/USDT:USDT'):
+                vol = ticker.get('quoteVolume') or 0
                 usdt_pairs.append((symbol, vol))
-        
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         return [x[0] for x in usdt_pairs[:n]]
     except Exception as e:
         print(f"取得幣種清單失敗: {e}")
         return []
 
-def analyze_symbol(symbol):
-    try:
+
+def check_timeframe_short(df):
+    """單一時區獨立檢查：死叉狀態 + K棒收在均線下方"""
+    if df is None or len(df) < 25:
+        return False, None
+
+    ema_7 = df['close'].ewm(span=7, adjust=False).mean()
+    ema_22 = df['close'].ewm(span=22, adjust=False).mean()
+
+    prev_bar = df.iloc[-3]
+    curr_bar = df.iloc[-2]
+
+    dead_cross = (ema_7.iloc[-3] >= ema_22.iloc[-3]) and (ema_7.iloc[-2] < ema_22.iloc[-2])
+    below_ema = (curr_bar['close'] < ema_7.iloc[-2]) and (curr_bar['close'] < ema_22.iloc[-2])
+
+    if dead_cross and below_ema:
+        return True, curr_bar
+    return False, None
+
+
+def scan_market():
+    print(f"開始掃描 OKX 前 {TOP_N} 大合約【5m / 15m / 1h 獨立：死叉狀態 + K棒收在均線下方】...")
+    symbols = get_top_usdt_swaps(TOP_N)
+    found_count = 0
+
+    for symbol in symbols:
         coin_name = symbol.split('/')[0]
-        
-        # ================= 策略 A：1H 搭配 15M (大趨勢波段) =================
-        df_1h = get_ohlcv(symbol, '1h', limit=100)
-        df_15m_a = get_ohlcv(symbol, '15m', limit=100)
-        if df_1h is not None and df_15m_a is not None:
-            macd_1h = calculate_macd(df_1h['close'])
-            ema_7_15 = df_15m_a['close'].ewm(span=7, adjust=False).mean()
-            ema_22_15 = df_15m_a['close'].ewm(span=22, adjust=False).mean()
-            vol_ma_15 = df_15m_a['volume'].rolling(window=20).mean()
-            
-            if macd_1h.iloc[-2] < 0:
-                is_dead_cross_15 = (ema_7_15.iloc[-3] >= ema_22_15.iloc[-3]) and (ema_7_15.iloc[-2] < ema_22_15.iloc[-2])
-                if is_dead_cross_15 and (df_15m_a['volume'].iloc[-2] > vol_ma_15.iloc[-2]):
-                    price = df_15m_a['close'].iloc[-2]
-                    return (
-                        f"🚨 <b>[1H + 15M 波段做空訊號]：{coin_name}</b>\n"
-                        f"• 現價：<code>{price}</code>\n"
-                        f"• 1H 大趨勢：MACD 偏空向下\n"
-                        f"• 15M 進場：EMA 7/22 帶量死叉\n"
-                        f"• 建議風控：手動以前高為防守點"
-                    )
+        for tf in TIMEFRAMES:
+            df = get_ohlcv(symbol, tf, limit=150)
+            hit, bar = check_timeframe_short(df)
+            if hit and bar is not None:
+                found_count += 1
+                price = bar['close']
+                msg = (
+                    f"🔻 <b>[做空訊號：{coin_name}]</b>\n"
+                    f"• 時區：<code>{tf}</code>\n"
+                    f"• 現價：<code>{price}</code>\n"
+                    f"• 條件：EMA 7/22 死叉 + K棒收在均線下方"
+                )
+                send_tg(msg)
+                print(f"發現訊號：{symbol} [{tf}] 價格={price}")
+            time.sleep(0.15)
 
-        # ================= 策略 B：15M 搭配 5M (短線爆發) =================
-        df_15m_b = get_ohlcv(symbol, '15m', limit=100)
-        df_5m = get_ohlcv(symbol, '5m', limit=100)
-        if df_15m_b is not None and df_5m is not None:
-            macd_15m = calculate_macd(df_15m_b['close'])
-            ema_7_5 = df_5m['close'].ewm(span=7, adjust=False).mean()
-            ema_22_5 = df_5m['close'].ewm(span=22, adjust=False).mean()
-            vol_ma_5 = df_5m['volume'].rolling(window=20).mean()
-            
-            if macd_15m.iloc[-2] < 0:
-                is_dead_cross_5 = (ema_7_5.iloc[-3] >= ema_22_5.iloc[-3]) and (ema_7_5.iloc[-2] < ema_22_5.iloc[-2])
-                if is_dead_cross_5 and (df_5m['volume'].iloc[-2] > vol_ma_5.iloc[-2]):
-                    price = df_5m['close'].iloc[-2]
-                    return (
-                        f"⚡ <b>[15M + 5M 短線做空訊號]：{coin_name}</b>\n"
-                        f"• 現價：<code>{price}</code>\n"
-                        f"• 15M 中週期：MACD 偏空向下\n"
-                        f"• 5M 進場：EMA 7/22 帶量死叉\n"
-                        f"• 建議風控：手動以前高為防守點"
-                    )
+    print(f"本輪掃描完畢。發現訊號數：{found_count} 筆。")
 
-        return None
-    except Exception:
-        return None
 
 if __name__ == "__main__":
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 雙軌策略背景掃描開始...")
-    
-    coins = get_top_liquid_altcoins(50)
-    found_count = 0
-    
-    for sym in coins:
-        alert_msg = analyze_symbol(sym)
-        if alert_msg:
-            send_tg(alert_msg)
-            found_count += 1
-            print(f"發現訊號並已發送通知：{sym}")
-        time.sleep(0.3)
-        
-    print(f"本輪掃描完畢。發現訊號數：{found_count} 筆。")
+    scan_market()
