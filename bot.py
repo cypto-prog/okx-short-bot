@@ -121,10 +121,7 @@ def is_macd_dead_or_imminent(df):
     if pd.isna(curr['MACD_HIST']) or pd.isna(prev['MACD_HIST']):
         return False
 
-    # 1. 已死叉：MACD 線低於 Signal 線（柱狀圖 < 0）
     already_dead = curr['MACD_LINE'] < curr['MACD_SIGNAL']
-
-    # 2. 即將死叉：柱狀圖仍在正值但快速收斂（小於前一根 50% 且柱狀圖下降）
     imminent_dead = (
         curr['MACD_HIST'] > 0
         and prev['MACD_HIST'] > 0
@@ -145,10 +142,7 @@ def is_ema_dead_or_imminent(df):
     if not price or price <= 0:
         return False
 
-    # 1. 已死叉：EMA7 < EMA22
     already_dead = curr['EMA_7'] < curr['EMA_22']
-
-    # 2. 即將死叉：EMA7 仍在 EMA22 之上或貼近，但差距縮小且距離收斂在 0.15% 內
     curr_gap = curr['EMA_7'] - curr['EMA_22']
     prev_gap = prev['EMA_7'] - prev['EMA_22']
     gap_pct = abs(curr_gap) / price * 100
@@ -195,7 +189,7 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=150):
 
 
 def scan_market():
-    send_telegram_message("🔔 OKX 三策略（大時區雙死叉/準死叉加嚴版）掃描器已啟動...")
+    send_telegram_message("🔔 OKX 三策略掃描器已啟動（前 50 大合約）...")
     sent_signatures = get_recent_sent_signatures(limit=100)
 
     exchange = ccxt.okx({
@@ -223,9 +217,9 @@ def scan_market():
             usdt_swaps.append((symbol, quote_volume))
 
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
-    symbols = [item[0] for item in usdt_swaps[:100]]
+    symbols = [item[0] for item in usdt_swaps[:50]]
 
-    print("開始掃描 OKX 前 100 大合約【大時區 MACD+均線 即將/已死叉 加嚴版】...")
+    print("開始掃描 OKX 前 50 大合約【1H+15m / 15m+5m / 15m單獨】...")
 
     triggered_count = 0
     skipped_dup_count = 0
@@ -246,18 +240,15 @@ def scan_market():
             matched_strategies = []
             ref_bar = None
 
-            # 策略 1：1H 配合 15m（1H 大時區 MACD + 均線 即將/已死叉）
             if major_1h_ok and hit_15m and bar_15m is not None:
                 matched_strategies.append("1H+15m")
                 ref_bar = bar_15m
 
-            # 策略 2：15m 配合 5m（15m 大時區 MACD + 均線 即將/已死叉）
             if major_15m_ok and hit_5m and bar_5m is not None:
                 matched_strategies.append("15m+5m")
                 if ref_bar is None:
                     ref_bar = bar_5m
 
-            # 策略 3：15m 單獨（15m MACD + 均線 即將/已死叉 且收盤低於 EMA7/22）
             if major_15m_ok and hit_15m and bar_15m is not None:
                 matched_strategies.append("15m單獨")
                 if ref_bar is None:
@@ -315,4 +306,3 @@ def scan_market():
 
 if __name__ == "__main__":
     scan_market()
-    
