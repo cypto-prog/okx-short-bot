@@ -14,6 +14,9 @@ TELEGRAM_CHAT_ID = (
     or "7686655302"
 )
 
+# 2. 做空空間過濾門檻：收盤價距離下方大級別均線 (EMA_85 / EMA_120) 至少需有幾 % 空間
+MIN_DOWNSIDE_SPACE_PCT = 1.2
+
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -110,6 +113,48 @@ def calculate_indicators(df):
     return df
 
 
+def is_ema7_22_above_85_120(bar):
+    """檢查 EMA_7 與 EMA_22 兩條均線是否都在 EMA_85 與 EMA_120 上方"""
+    if bar is None:
+        return False
+    cols = ['EMA_7', 'EMA_22', 'EMA_85', 'EMA_120']
+    if any(pd.isna(bar[c]) for c in cols):
+        return False
+    return bool(
+        bar['EMA_7'] > bar['EMA_85']
+        and bar['EMA_7'] > bar['EMA_120']
+        and bar['EMA_22'] > bar['EMA_85']
+        and bar['EMA_22'] > bar['EMA_120']
+    )
+
+
+def get_downside_space_pct(bar):
+    """計算剛收盤 K 棒距離下方大級別均線 (EMA_85 / EMA_120) 的下跌空間百分比"""
+    if bar is None:
+        return None
+    price = bar['close']
+    ema_85 = bar['EMA_85']
+    ema_120 = bar['EMA_120']
+    if not price or price <= 0 or pd.isna(ema_85) or pd.isna(ema_120):
+        return None
+
+    # 取收盤價下方的均線作為支撐參考；若兩條都在下方，取較近的一條（較高值）作為最近阻力/支撐
+    below_emas = [e for e in (ema_85, ema_120) if e < price]
+    if not below_emas:
+        return 0.0
+
+    nearest_lower_ema = max(below_emas)
+    return (price - nearest_lower_ema) / price * 100
+
+
+def has_enough_downside_space(bar, min_pct=MIN_DOWNSIDE_SPACE_PCT):
+    """做空前提：K 棒距離下方大級別均線還有足夠空間"""
+    space_pct = get_downside_space_pct(bar)
+    if space_pct is None:
+        return False, None
+    return bool(space_pct >= min_pct), space_pct
+
+
 def is_macd_dead_or_imminent(df):
     """判斷剛收盤 K 棒(-2)的 MACD 是否已死叉或即將死叉"""
     if df is None or len(df) < 5:
@@ -156,25 +201,33 @@ def is_ema_dead_or_imminent(df):
     return bool(already_dead or imminent_dead)
 
 
-def check_dead_cross_below_ema(df):
-    """檢查小週期剛收盤 K 棒：處於死叉狀態 (EMA7 < EMA22) 且收盤低於 EMA7 與 EMA22"""
+def check_major_tf_setup(df):
+    """大時區條件：MACD 即將/已死叉 且 EMA7/22 即將/已死叉 且 EMA7、EMA22 在 EMA85、EMA120 上方"""
     if df is None or len(df) < 5:
         return False, None
-
-    curr_bar = df.iloc[-2]
-    in_dead_cross = curr_bar['EMA_7'] < curr_bar['EMA_22']
-    close_below_ema = (
-        curr_bar['close'] < curr_bar['EMA_7']
-        and curr_bar['close'] < curr_bar['EMA_22']
+    curr = df.iloc[-2]
+    ok = (
+        is_macd_dead_or_imminent(df)
+        and is_ema_dead_or_imminent(df)
+        and is_ema7_22_above_85_120(curr)
     )
-    return bool(in_dead_cross and close_below_ema), curr_bar
+    return bool(ok), curr
 
 
-def check_major_tf_bearish_setup(df):
-    """大時區嚴格條件：MACD 即將/已死叉 且 EMA7/22 即將/已死叉"""
+def check_minor_tf_setup(df):
+    """小/目標時區條件：EMA7、EMA22 在 EMA85、EMA120 上方，且出現死叉或收盤低於 EMA7/EMA22"""
     if df is None or len(df) < 5:
-        return False
-    return bool(is_macd_dead_or_imminent(df) and is_ema_dead_or_imminent(df))
+        return False, None
+    curr = df.iloc[-2]
+    if not is_ema7_22_above_85_120(curr):
+        return False, None
+
+    in_dead_cross = curr['EMA_7'] < curr['EMA_22']
+    close_below_ema = (
+        curr['close'] < curr['EMA_7']
+        and curr['close'] < curr['EMA_22']
+    )
+    return bool(in_dead_cross or close_below_ema), curr
 
 
 def fetch_tf_df(exchange, symbol, timeframe, limit=150):
@@ -189,7 +242,9 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=150):
 
 
 def scan_market():
-    send_telegram_message("🔔 OKX 三策略掃描器已啟動（前 50 大合約）...")
+    send_telegram_message(
+        f"🔔 OKX 三策略掃描器已啟動（前 50 大｜下方均線空間 >= {MIN_DOWNSIDE_SPACE_PCT}%）..."
+    )
     sent_signatures = get_recent_sent_signatures(limit=100)
 
     exchange = ccxt.okx({
@@ -219,7 +274,10 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:50]]
 
-    print("開始掃描 OKX 前 50 大合約【1H+15m / 15m+5m / 15m單獨】...")
+    print(
+        f"開始掃描 OKX 前 50 大合約【1H+15m / 15m+5m / 15m單獨｜"
+        f"EMA 7、22 > 85、120｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
+    )
 
     triggered_count = 0
     skipped_dup_count = 0
@@ -231,28 +289,41 @@ def scan_market():
             df_15m = fetch_tf_df(exchange, symbol, '15m', limit=150)
             df_5m = fetch_tf_df(exchange, symbol, '5m', limit=150)
 
-            major_1h_ok = check_major_tf_bearish_setup(df_1h)
-            major_15m_ok = check_major_tf_bearish_setup(df_15m)
+            major_1h_ok, _ = check_major_tf_setup(df_1h)
+            major_15m_ok, _ = check_major_tf_setup(df_15m)
 
-            hit_15m, bar_15m = check_dead_cross_below_ema(df_15m)
-            hit_5m, bar_5m = check_dead_cross_below_ema(df_5m)
+            hit_15m, bar_15m = check_minor_tf_setup(df_15m)
+            hit_5m, bar_5m = check_minor_tf_setup(df_5m)
 
             matched_strategies = []
             ref_bar = None
+            ref_space_pct = None
 
+            # 策略 1：1H 配合 15m（以 15m 進場K棒檢查下方大均線空間）
             if major_1h_ok and hit_15m and bar_15m is not None:
-                matched_strategies.append("1H+15m")
-                ref_bar = bar_15m
-
-            if major_15m_ok and hit_5m and bar_5m is not None:
-                matched_strategies.append("15m+5m")
-                if ref_bar is None:
-                    ref_bar = bar_5m
-
-            if major_15m_ok and hit_15m and bar_15m is not None:
-                matched_strategies.append("15m單獨")
-                if ref_bar is None:
+                space_ok, space_pct = has_enough_downside_space(bar_15m)
+                if space_ok:
+                    matched_strategies.append("1H+15m")
                     ref_bar = bar_15m
+                    ref_space_pct = space_pct
+
+            # 策略 2：15m 配合 5m（以 5m 進場K棒檢查下方大均線空間）
+            if major_15m_ok and hit_5m and bar_5m is not None:
+                space_ok, space_pct = has_enough_downside_space(bar_5m)
+                if space_ok:
+                    matched_strategies.append("15m+5m")
+                    if ref_bar is None:
+                        ref_bar = bar_5m
+                        ref_space_pct = space_pct
+
+            # 策略 3：15m 單獨（以 15m 進場K棒檢查下方大均線空間）
+            if major_15m_ok and hit_15m and bar_15m is not None:
+                space_ok, space_pct = has_enough_downside_space(bar_15m)
+                if space_ok:
+                    matched_strategies.append("15m單獨")
+                    if ref_bar is None:
+                        ref_bar = bar_15m
+                        ref_space_pct = space_pct
 
             if matched_strategies and ref_bar is not None:
                 close_price = ref_bar['close']
@@ -278,6 +349,8 @@ def scan_market():
                     f"🚨 OKX 三策略掃描觸發 🚨\n\n"
                     f"📌 標的: {symbol}\n"
                     f"🎯 符合策略: {strat_label}\n"
+                    f"📐 均線結構: EMA 7、22 > EMA 85、120\n"
+                    f"📉 下方大均線空間: {ref_space_pct:.2f}%\n"
                     f"💰 收盤價: {close_price}\n"
                     f"🛑 建議止損 (SL): {stop_loss:.4f} (1.1x ATR)\n"
                     f"🎯 建議指盈 (TP): {take_profit:.4f} (1.6x ATR)"
@@ -285,7 +358,7 @@ def scan_market():
 
                 if send_telegram_message(msg):
                     sent_signatures.add(signature)
-                print(f"發現符合標的: {symbol} [{strat_label}]")
+                print(f"發現符合標的: {symbol} [{strat_label}] 空間={ref_space_pct:.2f}%")
 
             time.sleep(0.15)
 
