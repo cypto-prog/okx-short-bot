@@ -46,19 +46,18 @@ def calculate_indicators(df):
 
 
 def check_timeframe_signal(df):
-    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生：快線下穿慢線 + K棒收在均線下方"""
+    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生：死叉狀態(EMA_7 < EMA_22) + K棒收在均線下方"""
     if len(df) < 5:
         return False, None
 
-    prev_bar = df.iloc[-3]
     curr_bar = df.iloc[-2]
 
-    # 1. 快線(EMA_7)下穿慢線(EMA_22)
-    dead_cross = (prev_bar['EMA_7'] >= prev_bar['EMA_22']) and (curr_bar['EMA_7'] < curr_bar['EMA_22'])
+    # 1. 快線在慢線下方（死叉狀態，不限剛好那一根）
+    in_dead_cross = curr_bar['EMA_7'] < curr_bar['EMA_22']
     # 2. 剛收盤 K 棒收在均線下方
     close_below_ema = (curr_bar['close'] < curr_bar['EMA_7']) and (curr_bar['close'] < curr_bar['EMA_22'])
 
-    triggered = dead_cross and close_below_ema
+    triggered = in_dead_cross and close_below_ema
     return triggered, curr_bar
 
 
@@ -87,7 +86,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print("開始掃描 OKX 前 100 大合約【5m / 15m / 1h 獨立：快線下穿慢線 + K棒收在均線下方】...")
+    print("開始掃描 OKX 前 100 大合約【5m / 15m / 1h 獨立：死叉狀態 + K棒收在均線下方】...")
     triggered_count = 0
 
     for symbol in symbols:
