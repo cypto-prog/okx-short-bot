@@ -60,19 +60,21 @@ def calculate_indicators(df):
 
 
 def check_timeframe_signal(df):
-    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生「均線死叉 + RSI超買」"""
+    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生：快線下穿慢線 + K棒收在均線下方 + RSI超買"""
     if len(df) < 5:
         return False, None
 
     prev_bar = df.iloc[-3]
     curr_bar = df.iloc[-2]
 
-    # 均線死叉：前一根 EMA_7 >= EMA_22，剛收盤這根 EMA_7 < EMA_22
+    # 1. 快線(EMA_7)下穿慢線(EMA_22)
     dead_cross = (prev_bar['EMA_7'] >= prev_bar['EMA_22']) and (curr_bar['EMA_7'] < curr_bar['EMA_22'])
-    # RSI 超買
+    # 2. 剛收盤 K 棒收在均線下方
+    close_below_ema = (curr_bar['close'] < curr_bar['EMA_7']) and (curr_bar['close'] < curr_bar['EMA_22'])
+    # 3. RSI 超買
     rsi_overbought = curr_bar['RSI'] > RSI_OVERBOUGHT
 
-    triggered = dead_cross and rsi_overbought
+    triggered = dead_cross and close_below_ema and rsi_overbought
     return triggered, curr_bar
 
 
@@ -101,7 +103,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print(f"開始掃描 OKX 前 100 大合約【5m / 15m / 1h 獨立：均線死叉 + RSI>{RSI_OVERBOUGHT} 超買】...")
+    print(f"開始掃描 OKX 前 100 大合約【5m / 15m / 1h 統一：死叉 + 收盤在均線下 + RSI>{RSI_OVERBOUGHT}】...")
     triggered_count = 0
 
     for symbol in symbols:
@@ -152,11 +154,11 @@ def scan_market():
                 take_profit = close_price - (1.6 * atr)
 
                 msg = (
-                    f"🚨 **OKX 死叉+RSI超買 訊號觸發** 🚨\n\n"
+                    f"🚨 **OKX 死叉+收盤均線下+RSI超買 觸發** 🚨\n\n"
                     f"📌 **標的**: `{symbol}`\n"
                     f"⏰ **觸發時區**: `{', '.join(matched_tfs)}`\n"
                     f"📊 **超買數值**: `{', '.join(rsi_details)}`\n"
-                    f"💰 **參考收盤價**: `{close_price}`\n"
+                    f"💰 **收盤價**: `{close_price}`\n"
                     f"🛑 **建議止損 (SL)**: `{stop_loss:.4f}` (1.1x ATR)\n"
                     f"🎯 **建議指盈 (TP)**: `{take_profit:.4f}` (1.6x ATR)"
                 )
