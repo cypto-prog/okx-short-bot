@@ -32,7 +32,7 @@ def calculate_indicators(df):
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    # MACD 參數已改為 10, 20, 7
+    # MACD 參數 (10, 20, 7)
     exp1 = df['close'].ewm(span=10, adjust=False).mean()
     exp2 = df['close'].ewm(span=20, adjust=False).mean()
     df['MACD'] = exp1 - exp2
@@ -73,7 +73,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print(f"開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉(10,20,7) 空單策略】...")
+    print("開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉(10,20,7) 空單策略（含5m獨立）】...")
 
     for symbol in symbols:
         try:
@@ -96,22 +96,24 @@ def scan_market():
             r_15m = df_15m.iloc[-2]
             r_5m = df_5m.iloc[-2]
             r_15m_prev = df_15m.iloc[-3]
+            r_5m_prev = df_5m.iloc[-3]
 
-            # --- 策略一：1h 配合 15m (僅留均線與 MACD) ---
+            # --- 策略一：1h 配合 15m ---
             track_1 = (
                 (r_1h['EMA_7'] < r_1h['EMA_22']) and 
                 (r_15m['EMA_7'] < r_15m['EMA_22']) and 
                 (r_15m['MACD_Hist'] < 0)
             )
 
-            # --- 策略二：15m 配合 5m (僅留均線與 MACD) ---
-            track_2 = (
-                (r_15m['EMA_7'] < r_15m['EMA_22']) and 
-                (r_5m['EMA_7'] < r_5m['EMA_22']) and 
-                (r_5m['MACD_Hist'] < 0)
+            # --- 策略二：5m 獨立自主觸發 (均線死叉 + MACD死叉/翻空) ---
+            is_ema_dead_cross_5m = (r_5m['EMA_7'] < r_5m['EMA_22'])
+            is_macd_cross_or_ready_5m = (
+                (r_5m['MACD'] < r_5m['MACD_Signal']) or 
+                (r_5m_prev['MACD_Hist'] >= 0 and r_5m['MACD_Hist'] < 0)
             )
+            track_2 = is_ema_dead_cross_5m and is_macd_cross_or_ready_5m
 
-            # --- 策略三：15m 獨立自主觸發 (均線死叉 + MACD死叉) ---
+            # --- 策略三：15m 獨立自主觸發 (均線死叉 + MACD死叉/翻空) ---
             is_ema_dead_cross_15m = (r_15m['EMA_7'] < r_15m['EMA_22'])
             is_macd_cross_or_ready_15m = (
                 (r_15m['MACD'] < r_15m['MACD_Signal']) or 
@@ -127,7 +129,7 @@ def scan_market():
 
                 trigger_source = []
                 if track_1: trigger_source.append("1h+15m共振(空)")
-                if track_2: trigger_source.append("15m+5m共振(空)")
+                if track_2: trigger_source.append("5m獨立(均線死叉+MACD死叉)")
                 if track_3: trigger_source.append("15m獨立(均線死叉+MACD死叉)")
 
                 msg = (
