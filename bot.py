@@ -3,7 +3,7 @@ import ccxt
 import pandas as pd
 import requests
 
-# 1. 取得 Telegram 設定（優先讀取 Secrets，若無則使用最新重設之 Token）
+# 1. 取得 Telegram 設定
 TELEGRAM_BOT_TOKEN = (
     os.environ.get("TELEGRAM_BOT_TOKEN")
     or "9162800441:AAEERg3azJje9icu12UQUTzhFiAcnE4ljg"
@@ -278,13 +278,13 @@ def scan_market():
                 take_profit = close_price - (1.6 * atr)
 
                 msg = (
-                    f"🚨 **OKX 死叉+收盤均線下+RSI超買 觸發** 🚨\n\n"
-                    f"📌 **標的**: `{symbol}`\n"
-                    f"⏰ **觸發時區**: `{', '.join(matched_tfs)}`\n"
-                    f"📊 **超買數值**: `{', '.join(rsi_details)}`\n"
-                    f"💰 **收盤價**: `{close_price}`\n"
-                    f"🛑 **建議止損 (SL)**: `{stop_loss:.4f}` (1.1x ATR)\n"
-                    f"🎯 **建議指盈 (TP)**: `{take_profit:.4f}` (1.6x ATR)"
+                    f"🚨 *OKX 死叉+收盤均線下+RSI超買 觸發* 🚨\n\n"
+                    f"📌 *標的*: `{symbol}`\n"
+                    f"⏰ *觸發時區*: `{', '.join(matched_tfs)}`\n"
+                    f"📊 *超買數值*: `{', '.join(rsi_details)}`\n"
+                    f"💰 *收盤價*: `{close_price}`\n"
+                    f"🛑 *建議止損 (SL)*: `{stop_loss:.4f}` (1.1x ATR)\n"
+                    f"🎯 *建議指盈 (TP)*: `{take_profit:.4f}` (1.6x ATR)"
                 )
 
                 send_telegram_message(msg)
