@@ -1,11 +1,13 @@
-
 import os
 import ccxt
 import pandas as pd
 import requests
 
-# 1. 取得 Telegram 設定
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# 1. 取得 Telegram 設定（優先讀取 Secrets，若無則使用最新重設之 Token）
+TELEGRAM_BOT_TOKEN = (
+    os.environ.get("TELEGRAM_BOT_TOKEN")
+    or "9162800441:AAEERg3azJje9icu12UQUTzhFiAcnE4ljg"
+)
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # RSI 設定
@@ -15,7 +17,7 @@ RSI_OVERBOUGHT = 70
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram 密鑰未設定，略過發送。")
+        print("Telegram 密鑰或 CHAT_ID 未設定，略過發送。")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
