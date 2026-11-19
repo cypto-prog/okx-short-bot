@@ -4,7 +4,10 @@ import pandas as pd
 import requests
 
 # 1. 取得 Telegram 設定
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or "916280041:AAHMmgcMylC2k7_SwyjD9gaPTztW6u2GQRo"
+TELEGRAM_BOT_TOKEN = (
+    os.environ.get("TELEGRAM_BOT_TOKEN")
+    or "9162800441:AAEERg3azJje9icu12UQUTzhFiAcnE4ljg"
+)
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "7686655302"
 
 
