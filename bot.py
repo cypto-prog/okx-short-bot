@@ -7,6 +7,11 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# 可自行調整的 RSI 超買門檻
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+
+
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram 密鑰未設定，略過發送。")
@@ -26,19 +31,24 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"發送 Telegram 發生錯誤: {e}")
 
+
 def calculate_indicators(df):
     df['EMA_7'] = df['close'].ewm(span=7, adjust=False).mean()
     df['EMA_22'] = df['close'].ewm(span=22, adjust=False).mean()
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    # MACD 參數 (10, 20, 7)
-    exp1 = df['close'].ewm(span=10, adjust=False).mean()
-    exp2 = df['close'].ewm(span=20, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df['MACD_Signal'] = df['MACD'].ewm(span=7, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    # RSI 計算 (Wilder's smoothing / EWM)
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float('nan'))
+    df['RSI'] = 100 - (100 / (1 + rs))
+    df['RSI'] = df['RSI'].fillna(100)
 
+    # ATR 用於風控停損止盈
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -47,6 +57,24 @@ def calculate_indicators(df):
     df['ATR'] = true_range.rolling(window=14).mean()
 
     return df
+
+
+def check_timeframe_signal(df):
+    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生「均線死叉 + RSI超買」"""
+    if len(df) < 5:
+        return False, None
+
+    prev_bar = df.iloc[-3]
+    curr_bar = df.iloc[-2]
+
+    # 均線死叉：前一根 EMA_7 >= EMA_22，剛收盤這根 EMA_7 < EMA_22
+    dead_cross = (prev_bar['EMA_7'] >= prev_bar['EMA_22']) and (curr_bar['EMA_7'] < curr_bar['EMA_22'])
+    # RSI 超買
+    rsi_overbought = curr_bar['RSI'] > RSI_OVERBOUGHT
+
+    triggered = dead_cross and rsi_overbought
+    return triggered, curr_bar
+
 
 def scan_market():
     exchange = ccxt.okx({
@@ -73,85 +101,73 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print("開始掃描 OKX 前 100 大合約【純均線死叉 + MACD死叉(10,20,7) 空單策略（5m獨立）】...")
+    print(f"開始掃描 OKX 前 100 大合約【5m / 15m / 1h 獨立：均線死叉 + RSI>{RSI_OVERBOUGHT} 超買】...")
     triggered_count = 0
 
     for symbol in symbols:
         try:
-            ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
-            df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_1h = calculate_indicators(df_1h)
+            ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=150)
+            df_5m = calculate_indicators(
+                pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            )
 
             ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=150)
-            df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_15m = calculate_indicators(df_15m)
-
-            ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=150)
-            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_5m = calculate_indicators(df_5m)
-
-            if len(df_1h) < 5 or len(df_15m) < 5 or len(df_5m) < 5:
-                continue
-
-            r_1h = df_1h.iloc[-2]
-            r_15m = df_15m.iloc[-2]
-            r_5m = df_5m.iloc[-2]
-            r_15m_prev = df_15m.iloc[-3]
-            r_5m_prev = df_5m.iloc[-3]
-
-            # --- 策略一：1h 配合 15m ---
-            track_1 = (
-                (r_1h['EMA_7'] < r_1h['EMA_22']) and
-                (r_15m['EMA_7'] < r_15m['EMA_22']) and
-                (r_15m['MACD_Hist'] < 0)
+            df_15m = calculate_indicators(
+                pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             )
 
-            # --- 策略二：5m 獨立自主觸發 (均線空頭 + MACD死叉/翻空) ---
-            is_ema_bear_5m = (r_5m['EMA_7'] < r_5m['EMA_22'])
-            is_macd_cross_or_ready_5m = (
-                (r_5m['MACD'] < r_5m['MACD_Signal']) or
-                (r_5m_prev['MACD_Hist'] >= 0 and r_5m['MACD_Hist'] < 0)
+            ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
+            df_1h = calculate_indicators(
+                pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             )
-            track_2 = is_ema_bear_5m and is_macd_cross_or_ready_5m
 
-            # --- 策略三：15m 獨立自主觸發 (均線空頭 + MACD死叉/翻空) ---
-            is_ema_bear_15m = (r_15m['EMA_7'] < r_15m['EMA_22'])
-            is_macd_cross_or_ready_15m = (
-                (r_15m['MACD'] < r_15m['MACD_Signal']) or
-                (r_15m_prev['MACD_Hist'] >= 0 and r_15m['MACD_Hist'] < 0)
-            )
-            track_3 = is_ema_bear_15m and is_macd_cross_or_ready_15m
+            hit_5m, bar_5m = check_timeframe_signal(df_5m)
+            hit_15m, bar_15m = check_timeframe_signal(df_15m)
+            hit_1h, bar_1h = check_timeframe_signal(df_1h)
 
-            if track_1 or track_2 or track_3:
+            matched_tfs = []
+            ref_bar = None
+            rsi_details = []
+
+            if hit_5m:
+                matched_tfs.append("5m")
+                ref_bar = bar_5m
+                rsi_details.append(f"5m RSI: {bar_5m['RSI']:.1f}")
+            if hit_15m:
+                matched_tfs.append("15m")
+                if ref_bar is None:
+                    ref_bar = bar_15m
+                rsi_details.append(f"15m RSI: {bar_15m['RSI']:.1f}")
+            if hit_1h:
+                matched_tfs.append("1h")
+                if ref_bar is None:
+                    ref_bar = bar_1h
+                rsi_details.append(f"1h RSI: {bar_1h['RSI']:.1f}")
+
+            if matched_tfs and ref_bar is not None:
                 triggered_count += 1
-                close_price = r_5m['close']
-                atr = r_5m['ATR']
+                close_price = ref_bar['close']
+                atr = ref_bar['ATR']
                 stop_loss = close_price + (1.1 * atr)
                 take_profit = close_price - (1.6 * atr)
 
-                trigger_source = []
-                if track_1:
-                    trigger_source.append("1h+15m共振(空)")
-                if track_2:
-                    trigger_source.append("5m獨立(均線死叉+MACD死叉)")
-                if track_3:
-                    trigger_source.append("15m獨立(均線死叉+MACD死叉)")
-
                 msg = (
-                    f"🚨 **OKX 智能空單訊號觸發** 🚨\n\n"
+                    f"🚨 **OKX 死叉+RSI超買 訊號觸發** 🚨\n\n"
                     f"📌 **標的**: `{symbol}`\n"
-                    f"⏰ **觸發來源**: `{', '.join(trigger_source)}`\n"
-                    f"💰 **建議進場價**: `{close_price}`\n"
+                    f"⏰ **觸發時區**: `{', '.join(matched_tfs)}`\n"
+                    f"📊 **超買數值**: `{', '.join(rsi_details)}`\n"
+                    f"💰 **參考收盤價**: `{close_price}`\n"
                     f"🛑 **建議止損 (SL)**: `{stop_loss:.4f}` (1.1x ATR)\n"
                     f"🎯 **建議指盈 (TP)**: `{take_profit:.4f}` (1.6x ATR)"
                 )
                 send_telegram_message(msg)
-                print(f"發現符合空單條件標的: {symbol} [{', '.join(trigger_source)}]")
+                print(f"發現符合標的: {symbol} [{', '.join(matched_tfs)}] ({', '.join(rsi_details)})")
 
         except Exception as e:
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
 
     print(f"掃描完成，本輪共觸發 {triggered_count} 檔符合條件標的。")
+
 
 if __name__ == "__main__":
     scan_market()
