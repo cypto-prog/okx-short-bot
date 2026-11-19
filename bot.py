@@ -39,6 +39,52 @@ def send_telegram_message(message):
         return False
 
 
+def get_recent_sent_signatures(limit=100):
+    """從近期 Telegram 訊息紀錄讀取已發送過的訊號簽章，避免重複推播"""
+    seen = set()
+    if not TELEGRAM_BOT_TOKEN:
+        return seen
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"limit": limit}
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code != 200:
+            return seen
+
+        data = response.json()
+        for item in data.get("result", []):
+            msg_obj = (
+                item.get("message")
+                or item.get("channel_post")
+                or {}
+            )
+            chat_id = str(msg_obj.get("chat", {}).get("id", ""))
+            if chat_id and chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+
+            text = msg_obj.get("text", "")
+            if "OKX 死叉+收盤均線下 觸發" not in text:
+                continue
+
+            symbol_line = ""
+            tf_line = ""
+            for line in text.splitlines():
+                if "標的:" in line:
+                    symbol_line = line.split("標的:", 1)[1].strip()
+                elif "觸發時區:" in line:
+                    tf_line = line.split("觸發時區:", 1)[1].strip()
+
+            if symbol_line and tf_line:
+                seen.add(f"{symbol_line}|{tf_line}")
+
+    except Exception as e:
+        print(f"讀取歷史訊號紀錄時略過錯誤: {e}")
+
+    return seen
+
+
 def calculate_indicators(df):
     df['EMA_7'] = df['close'].ewm(span=7, adjust=False).mean()
     df['EMA_22'] = df['close'].ewm(span=22, adjust=False).mean()
@@ -86,6 +132,7 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=150):
 
 def scan_market():
     send_telegram_message("🔔 OKX 掃描器已啟動，開始檢查前 100 大 USDT 永續合約...")
+    sent_signatures = get_recent_sent_signatures(limit=100)
 
     exchange = ccxt.okx({
         'enableRateLimit': True,
@@ -117,6 +164,7 @@ def scan_market():
     print("開始掃描 OKX 前 100 大合約【5m / 15m / 1h：死叉狀態 + 收盤在均線下】...")
 
     triggered_count = 0
+    skipped_dup_count = 0
     error_count = 0
 
     for symbol in symbols:
@@ -154,6 +202,14 @@ def scan_market():
                     print(f"{symbol} ATR 資料不足，略過風控價格計算。")
                     continue
 
+                tf_label = ', '.join(matched_tfs)
+                signature = f"{symbol}|{tf_label}"
+
+                if signature in sent_signatures:
+                    skipped_dup_count += 1
+                    print(f"略過重複訊號: {symbol} [{tf_label}]")
+                    continue
+
                 triggered_count += 1
                 stop_loss = close_price + (1.1 * atr)
                 take_profit = close_price - (1.6 * atr)
@@ -161,14 +217,15 @@ def scan_market():
                 msg = (
                     f"🚨 OKX 死叉+收盤均線下 觸發 🚨\n\n"
                     f"📌 標的: {symbol}\n"
-                    f"⏰ 觸發時區: {', '.join(matched_tfs)}\n"
+                    f"⏰ 觸發時區: {tf_label}\n"
                     f"💰 收盤價: {close_price}\n"
                     f"🛑 建議止損 (SL): {stop_loss:.4f} (1.1x ATR)\n"
                     f"🎯 建議指盈 (TP): {take_profit:.4f} (1.6x ATR)"
                 )
 
-                send_telegram_message(msg)
-                print(f"發現符合標的: {symbol} [{', '.join(matched_tfs)}]")
+                if send_telegram_message(msg):
+                    sent_signatures.add(signature)
+                print(f"發現符合標的: {symbol} [{tf_label}]")
 
             time.sleep(0.15)
 
@@ -179,7 +236,8 @@ def scan_market():
     summary = (
         f"✅ 本輪掃描完成\n"
         f"• 掃描標的數: {len(symbols)}\n"
-        f"• 觸發訊號數: {triggered_count}\n"
+        f"• 新觸發通知數: {triggered_count}\n"
+        f"• 略過重複數: {skipped_dup_count}\n"
         f"• 錯誤筆數: {error_count}"
     )
     print(summary)
