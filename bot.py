@@ -6,21 +6,13 @@ import ccxt
 import pandas as pd
 
 # ================= 參數設定 =================
-DEFAULT_TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
-DEFAULT_CHAT_ID = "7686655302"
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or DEFAULT_TELEGRAM_TOKEN
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or DEFAULT_CHAT_ID
-
+TELEGRAM_TOKEN = "9295995564:AAH8PkxghF_ngjZwMVpLUmMTpJ9rVx0EtYY"
+CHAT_ID = "7686655302"
 REPORT_RECORD_FILE = "last_report.txt"  # 記錄上次 10 天定期通知的時間檔
 REPORT_DAYS = 10                        # 設定每幾天發送一次定期通知
 
-
 def send_tg(message):
     """發送 Telegram 通知"""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram 設定不完整，略過發送。")
-        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -28,29 +20,26 @@ def send_tg(message):
         "parse_mode": "HTML"
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            print("Telegram 通知發送成功。")
-        else:
-            print(f"Telegram 發送失敗（狀態碼 {res.status_code}）: {res.text}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Telegram 發送失敗: {e}")
-
 
 def check_and_send_periodic_report():
     """檢查是否滿 10 天，若滿了則發送定期通知並更新記錄"""
     now = datetime.now()
     last_time = None
-
+    
+    # 讀取上次發送的時間
     if os.path.exists(REPORT_RECORD_FILE):
         try:
-            with open(REPORT_RECORD_FILE, "r", encoding="utf-8") as f:
+            with open(REPORT_RECORD_FILE, "r") as f:
                 content = f.read().strip()
                 if content:
                     last_time = datetime.fromisoformat(content)
         except Exception as e:
             print(f"讀取定期通知記錄失敗: {e}")
-
+            
+    # 如果從未發送過，或者距離上次已超過或等於設定的天數
     if last_time is None or (now - last_time) >= timedelta(days=REPORT_DAYS):
         report_msg = (
             f"🟢 <b>[OKX 機器人定期回報]</b>\n"
@@ -59,29 +48,25 @@ def check_and_send_periodic_report():
         )
         send_tg(report_msg)
         print("已發送每 10 天的定期存活通知。")
-
+        
+        # 寫入最新的發送時間
         try:
-            with open(REPORT_RECORD_FILE, "w", encoding="utf-8") as f:
+            with open(REPORT_RECORD_FILE, "w") as f:
                 f.write(now.isoformat())
         except Exception as e:
             print(f"寫入定期通知記錄失敗: {e}")
 
-
 # 初始化交易所
 exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
-
 
 def get_ohlcv(symbol, timeframe, limit=150):
     """取得 K 線數據"""
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        if not bars:
-            return None
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         return df
     except Exception:
         return None
-
 
 def calculate_macd(series, fast=12, slow=26, signal=9):
     """純 Pandas 計算 MACD"""
@@ -89,45 +74,43 @@ def calculate_macd(series, fast=12, slow=26, signal=9):
     exp2 = series.ewm(span=slow, adjust=False).mean()
     macd_line = exp1 - exp2
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line - signal_line
-
+    return macd_line - signal_line  # MACD Histogram / Line
 
 def get_top_liquid_altcoins(n=50):
     """自動撈取 24H 成交量最高的前 50 大高流動性山寨幣"""
     try:
         tickers = exchange.fetch_tickers()
         stable_coins = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'USDC/USDT:USDT']
-
+        
         usdt_pairs = []
         for symbol, ticker in tickers.items():
             if not symbol.endswith('/USDT:USDT'):
                 continue
             if symbol in stable_coins:
                 continue
-            vol = ticker.get('quoteVolume') or 0
+            vol = ticker.get('quoteVolume', 0)
             if vol > 10000000:
                 usdt_pairs.append((symbol, vol))
-
+        
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         return [x[0] for x in usdt_pairs[:n]]
     except Exception as e:
         print(f"取得幣種清單失敗: {e}")
         return []
 
-
 def analyze_symbol(symbol):
     try:
         coin_name = symbol.split('/')[0]
-
+        
         # ================= 策略 A：1H 搭配 15M (大趨勢波段) =================
         df_1h = get_ohlcv(symbol, '1h', limit=100)
         df_15m_a = get_ohlcv(symbol, '15m', limit=100)
-        if df_1h is not None and df_15m_a is not None and len(df_1h) >= 30 and len(df_15m_a) >= 25:
+        if df_1h is not None and df_15m_a is not None:
             macd_1h = calculate_macd(df_1h['close'])
             ema_7_15 = df_15m_a['close'].ewm(span=7, adjust=False).mean()
             ema_22_15 = df_15m_a['close'].ewm(span=22, adjust=False).mean()
             vol_ma_15 = df_15m_a['volume'].rolling(window=20).mean()
-
+            
             if macd_1h.iloc[-2] < 0:
                 is_dead_cross_15 = (ema_7_15.iloc[-3] >= ema_22_15.iloc[-3]) and (ema_7_15.iloc[-2] < ema_22_15.iloc[-2])
                 if is_dead_cross_15 and (df_15m_a['volume'].iloc[-2] > vol_ma_15.iloc[-2]):
@@ -143,12 +126,12 @@ def analyze_symbol(symbol):
         # ================= 策略 B：15M 搭配 5M (短線爆發) =================
         df_15m_b = get_ohlcv(symbol, '15m', limit=100)
         df_5m = get_ohlcv(symbol, '5m', limit=100)
-        if df_15m_b is not None and df_5m is not None and len(df_15m_b) >= 30 and len(df_5m) >= 25:
+        if df_15m_b is not None and df_5m is not None:
             macd_15m = calculate_macd(df_15m_b['close'])
             ema_7_5 = df_5m['close'].ewm(span=7, adjust=False).mean()
             ema_22_5 = df_5m['close'].ewm(span=22, adjust=False).mean()
             vol_ma_5 = df_5m['volume'].rolling(window=20).mean()
-
+            
             if macd_15m.iloc[-2] < 0:
                 is_dead_cross_5 = (ema_7_5.iloc[-3] >= ema_22_5.iloc[-3]) and (ema_7_5.iloc[-2] < ema_22_5.iloc[-2])
                 if is_dead_cross_5 and (df_5m['volume'].iloc[-2] > vol_ma_5.iloc[-2]):
@@ -165,15 +148,16 @@ def analyze_symbol(symbol):
     except Exception:
         return None
 
-
 if __name__ == "__main__":
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 雙軌策略背景掃描開始...")
-
+    
+    # 1. 檢查並執行每 10 天的定期存活通知
     check_and_send_periodic_report()
-
+    
+    # 2. 執行原本的市場掃描與訊號發送
     coins = get_top_liquid_altcoins(50)
     found_count = 0
-
+    
     for sym in coins:
         alert_msg = analyze_symbol(sym)
         if alert_msg:
@@ -181,5 +165,5 @@ if __name__ == "__main__":
             found_count += 1
             print(f"發現訊號並已發送通知：{sym}")
         time.sleep(0.3)
-
+        
     print(f"本輪掃描完畢。發現訊號數：{found_count} 筆。")
