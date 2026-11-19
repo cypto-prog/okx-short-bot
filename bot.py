@@ -7,10 +7,6 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# 可自行調整的 RSI 超買門檻
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-
 
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -38,16 +34,6 @@ def calculate_indicators(df):
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    # RSI 計算 (Wilder's smoothing / EWM)
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, float('nan'))
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df['RSI'] = df['RSI'].fillna(100)
-
     # ATR 用於風控停損止盈
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
@@ -60,7 +46,7 @@ def calculate_indicators(df):
 
 
 def check_timeframe_signal(df):
-    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生：快線下穿慢線 + K棒收在均線下方 + RSI超買"""
+    """檢查單一時區剛收盤那根 (iloc[-2]) 是否發生：快線下穿慢線 + K棒收在均線下方"""
     if len(df) < 5:
         return False, None
 
@@ -71,10 +57,8 @@ def check_timeframe_signal(df):
     dead_cross = (prev_bar['EMA_7'] >= prev_bar['EMA_22']) and (curr_bar['EMA_7'] < curr_bar['EMA_22'])
     # 2. 剛收盤 K 棒收在均線下方
     close_below_ema = (curr_bar['close'] < curr_bar['EMA_7']) and (curr_bar['close'] < curr_bar['EMA_22'])
-    # 3. RSI 超買
-    rsi_overbought = curr_bar['RSI'] > RSI_OVERBOUGHT
 
-    triggered = dead_cross and close_below_ema and rsi_overbought
+    triggered = dead_cross and close_below_ema
     return triggered, curr_bar
 
 
@@ -103,7 +87,7 @@ def scan_market():
     usdt_swaps.sort(key=lambda x: x[1], reverse=True)
     symbols = [item[0] for item in usdt_swaps[:100]]
 
-    print(f"開始掃描 OKX 前 100 大合約【5m / 15m / 1h 統一：死叉 + 收盤在均線下 + RSI>{RSI_OVERBOUGHT}】...")
+    print("開始掃描 OKX 前 100 大合約【5m / 15m / 1h 獨立：快線下穿慢線 + K棒收在均線下方】...")
     triggered_count = 0
 
     for symbol in symbols:
@@ -129,22 +113,18 @@ def scan_market():
 
             matched_tfs = []
             ref_bar = None
-            rsi_details = []
 
             if hit_5m:
                 matched_tfs.append("5m")
                 ref_bar = bar_5m
-                rsi_details.append(f"5m RSI: {bar_5m['RSI']:.1f}")
             if hit_15m:
                 matched_tfs.append("15m")
                 if ref_bar is None:
                     ref_bar = bar_15m
-                rsi_details.append(f"15m RSI: {bar_15m['RSI']:.1f}")
             if hit_1h:
                 matched_tfs.append("1h")
                 if ref_bar is None:
                     ref_bar = bar_1h
-                rsi_details.append(f"1h RSI: {bar_1h['RSI']:.1f}")
 
             if matched_tfs and ref_bar is not None:
                 triggered_count += 1
@@ -154,16 +134,15 @@ def scan_market():
                 take_profit = close_price - (1.6 * atr)
 
                 msg = (
-                    f"🚨 **OKX 死叉+收盤均線下+RSI超買 觸發** 🚨\n\n"
+                    f"🚨 **OKX 死叉+收盤均線下 訊號觸發** 🚨\n\n"
                     f"📌 **標的**: `{symbol}`\n"
                     f"⏰ **觸發時區**: `{', '.join(matched_tfs)}`\n"
-                    f"📊 **超買數值**: `{', '.join(rsi_details)}`\n"
                     f"💰 **收盤價**: `{close_price}`\n"
                     f"🛑 **建議止損 (SL)**: `{stop_loss:.4f}` (1.1x ATR)\n"
                     f"🎯 **建議指盈 (TP)**: `{take_profit:.4f}` (1.6x ATR)"
                 )
                 send_telegram_message(msg)
-                print(f"發現符合標的: {symbol} [{', '.join(matched_tfs)}] ({', '.join(rsi_details)})")
+                print(f"發現符合標的: {symbol} [{', '.join(matched_tfs)}]")
 
         except Exception as e:
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
