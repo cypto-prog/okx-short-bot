@@ -89,6 +89,7 @@ def get_recent_sent_signatures(limit=100):
 
 
 def calculate_indicators(df):
+    # 紫線: EMA_7 | 黃線: EMA_22 | 藍線: EMA_85 | 橘線: EMA_120
     df['EMA_7'] = df['close'].ewm(span=7, adjust=False).mean()
     df['EMA_22'] = df['close'].ewm(span=22, adjust=False).mean()
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
@@ -113,23 +114,17 @@ def calculate_indicators(df):
     return df
 
 
-def is_ema7_22_above_85_120(bar):
-    """檢查 EMA_7 與 EMA_22 兩條均線是否都在 EMA_85 與 EMA_120 上方"""
+def is_bullish_major_trend(bar):
+    """大級別多頭條件：藍線 (EMA_85) 在橘線 (EMA_120) 上方"""
     if bar is None:
         return False
-    cols = ['EMA_7', 'EMA_22', 'EMA_85', 'EMA_120']
-    if any(pd.isna(bar[c]) for c in cols):
+    if pd.isna(bar['EMA_85']) or pd.isna(bar['EMA_120']):
         return False
-    return bool(
-        bar['EMA_7'] > bar['EMA_85']
-        and bar['EMA_7'] > bar['EMA_120']
-        and bar['EMA_22'] > bar['EMA_85']
-        and bar['EMA_22'] > bar['EMA_120']
-    )
+    return bool(bar['EMA_85'] > bar['EMA_120'])
 
 
 def get_downside_space_pct(bar):
-    """計算剛收盤 K 棒距離下方大級別均線 (EMA_85 / EMA_120) 的下跌空間百分比"""
+    """計算剛收盤 K 棒距離下方大級別均線 (藍線 EMA_85 / 橘線 EMA_120) 的下跌空間百分比"""
     if bar is None:
         return None
     price = bar['close']
@@ -169,19 +164,18 @@ def check_major_macd_dead_cross(df):
     if any(pd.isna(v) for v in vals):
         return False
 
-    macd_cross_on_curr = (
+    return bool(
         (prev['MACD_LINE'] >= prev['MACD_SIGNAL'])
         and (curr['MACD_LINE'] < curr['MACD_SIGNAL'])
     )
-    return bool(macd_cross_on_curr)
 
 
 def check_minor_ema_dead_cross(df):
     """
-    小時區條件：
-    1. EMA_7 與 EMA_22 在 EMA_85 與 EMA_120 上方
-    2. EMA 7 / 22 死叉（剛收盤那根或前一根發生 EMA_7 下穿 EMA_22）
-    3. 剛收盤 K 棒收在 EMA_7 與 EMA_22 下方（不限影線）
+    小時區做空條件：
+    1. 大級別藍線 (EMA_85) 在橘線 (EMA_120) 上方（多頭背景）
+    2. 先確認均線死叉已發生（紫線 EMA_7 下穿黃線 EMA_22，死叉當根或前一根發生皆可）
+    3. 死叉後，目前處於死叉狀態且剛收盤 K 棒收在紫線與黃線下方（不限影線）
     """
     if df is None or len(df) < 6:
         return False, None
@@ -190,7 +184,7 @@ def check_minor_ema_dead_cross(df):
     prev = df.iloc[-3]
     prev2 = df.iloc[-4]
 
-    if not is_ema7_22_above_85_120(curr):
+    if not is_bullish_major_trend(curr):
         return False, None
 
     vals = [
@@ -201,21 +195,24 @@ def check_minor_ema_dead_cross(df):
     if any(pd.isna(v) for v in vals):
         return False, None
 
-    ema_cross_on_curr = (
-        (prev['EMA_7'] >= prev['EMA_22'])
-        and (curr['EMA_7'] < curr['EMA_22'])
+    # 1. 先確認均線死叉已發生
+    dead_cross_confirmed = (
+        ((prev['EMA_7'] >= prev['EMA_22']) and (curr['EMA_7'] < curr['EMA_22']))
+        or (
+            (prev2['EMA_7'] >= prev2['EMA_22'])
+            and (prev['EMA_7'] < prev['EMA_22'])
+            and (curr['EMA_7'] < curr['EMA_22'])
+        )
     )
-    ema_cross_on_prev = (
-        (prev2['EMA_7'] >= prev2['EMA_22'])
-        and (prev['EMA_7'] < prev['EMA_22'])
-        and (curr['EMA_7'] < curr['EMA_22'])
-    )
-    close_below_ema = (
-        (curr['close'] < curr['EMA_7'])
+
+    # 2. 死叉後 K 棒處在均線下方（目前死叉成立且收盤低於 EMA_7 與 EMA_22）
+    after_cross_below_ema = (
+        (curr['EMA_7'] < curr['EMA_22'])
+        and (curr['close'] < curr['EMA_7'])
         and (curr['close'] < curr['EMA_22'])
     )
 
-    return bool((ema_cross_on_curr or ema_cross_on_prev) and close_below_ema), curr
+    return bool(dead_cross_confirmed and after_cross_below_ema), curr
 
 
 def fetch_tf_df(exchange, symbol, timeframe, limit=150):
@@ -260,8 +257,8 @@ def scan_market():
     symbols = [item[0] for item in usdt_swaps[:50]]
 
     print(
-        f"開始掃描 OKX 前 50 大合約【大時區 MACD 死叉 + 小時區 EMA 7/22 死叉｜"
-        f"EMA 7、22 > 85、120｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
+        f"開始掃描 OKX 前 50 大合約【先確認均線死叉 → 死叉後收盤均線下｜"
+        f"藍線>橘線 + 大時區MACD死叉｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
     )
 
     triggered_count = 0
@@ -284,7 +281,6 @@ def scan_market():
             ref_bar = None
             ref_space_pct = None
 
-            # 策略 1：1H 配合 15m（1H MACD 死叉 + 15m EMA 7/22 死叉）
             if macd_dead_1h and ema_dead_15m and bar_15m is not None:
                 space_ok, space_pct = has_enough_downside_space(bar_15m)
                 if space_ok:
@@ -292,7 +288,6 @@ def scan_market():
                     ref_bar = bar_15m
                     ref_space_pct = space_pct
 
-            # 策略 2：15m 配合 5m（15m MACD 死叉 + 5m EMA 7/22 死叉）
             if macd_dead_15m and ema_dead_5m and bar_5m is not None:
                 space_ok, space_pct = has_enough_downside_space(bar_5m)
                 if space_ok:
@@ -301,7 +296,6 @@ def scan_market():
                         ref_bar = bar_5m
                         ref_space_pct = space_pct
 
-            # 策略 3：15m 單獨（15m MACD 死叉 + 15m EMA 7/22 死叉）
             if macd_dead_15m and ema_dead_15m and bar_15m is not None:
                 space_ok, space_pct = has_enough_downside_space(bar_15m)
                 if space_ok:
@@ -334,8 +328,7 @@ def scan_market():
                     f"🚨 OKX 三策略掃描觸發 🚨\n\n"
                     f"📌 標的: {symbol}\n"
                     f"🎯 符合策略: {strat_label}\n"
-                    f"📉 訊號結構: 大時區 MACD 死叉 + 小時區 EMA 7/22 死叉\n"
-                    f"📐 均線結構: EMA 7、22 > EMA 85、120\n"
+                    f"📉 訊號邏輯: 均線死叉確認 → 死叉後收盤均線下\n"
                     f"📊 下方大均線空間: {ref_space_pct:.2f}%\n"
                     f"💰 收盤價: {close_price}\n"
                     f"🛑 建議止損 (SL): {stop_loss:.4f} (1.1x ATR)\n"
