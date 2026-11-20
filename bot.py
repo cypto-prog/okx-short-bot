@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import ccxt
 import pandas as pd
@@ -23,9 +24,26 @@ TOP_N_SYMBOLS = 100
 SKIP_TOP_RANK_COUNT = 0
 MIN_QUOTE_VOLUME_USDT = 1_000_000  # 最低 24h 成交額門檻（若抓不到或想掃更多可設 0）
 
+# 3. 排除美股代幣、貴金屬／商品等非加密貨幣延伸商品
+ONLY_CRYPTO_PERP = True
+
+# 明確排除的非加密貨幣代號（大寫 base 幣種）
+EXCLUDED_NON_CRYPTO_BASES = {
+    "XAU", "XAG", "XPT", "XPD",
+    "WTI", "BRENT", "USOIL", "UKOIL", "NG", "NATGAS",
+    "COPPER", "ALUMINUM", "NICKEL", "ZINC", "LEAD",
+    "CORN", "WHEAT", "SOYBEAN", "COFFEE", "SUGAR", "COTTON",
+    "SPX", "NDX", "DJI", "QQQ", "SPY", "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "MSTR",
+}
+
+# 常見代幣化美股／股票延伸商品前綴（例如 xRAM, xFLY, xSKUU, xVICR, xMSTR）
+EXCLUDED_NON_CRYPTO_PREFIXES = (
+    "X",
+)
+
 MIN_DOWNSIDE_SPACE_PCT = 0.8
 
-# 3. 大時區 MACD 即將死叉與防黏設定
+# 4. 大時區 MACD 即將死叉與防黏設定
 ALLOW_PRE_DEAD_CROSS = True
 MAX_MACD_GAP_PCT = 0.5
 REQUIRE_MACD_TURNING_DOWN = True
@@ -33,16 +51,16 @@ MIN_MACD_SPREAD_PCT = 0.05
 MACD_CHOP_LOOKBACK = 6
 MAX_MACD_CROSS_COUNT = 2
 
-# 4. 防黏均線 / 防洗盤過濾
+# 5. 防黏均線 / 防洗盤過濾
 MIN_EMA_SPREAD_PCT = 0.10
 MAX_LOWER_WICK_RATIO = 0.55
 COOLDOWN_BARS = 4
 
-# 5. 雙策略開關（只保留 1H+15m 與 15m+5m）
+# 6. 雙策略開關（只保留 1H+15m 與 15m+5m）
 ENABLE_1H_15M = True
 ENABLE_15M_5M = True
 
-# 6. ATR 風控設定
+# 7. ATR 風控設定
 ATR_LEN = 14
 SL_MULT = 1.15
 TP_MULT = 1.6
@@ -116,6 +134,56 @@ def get_recent_sent_signatures(limit=100):
         print(f"讀取歷史訊號紀錄時略過錯誤: {e}")
 
     return seen
+
+
+def extract_base_asset(symbol):
+    """從合約代號取出基礎幣種（例如 'PIPPIN/USDT:USDT' -> 'PIPPIN'）"""
+    base_part = symbol.split("/", 1)[0] if "/" in symbol else symbol.split("-", 1)[0]
+    return base_part.strip().upper()
+
+
+def is_crypto_perp_symbol(symbol, market=None, ticker=None):
+    """判斷是否為一般加密貨幣 USDT 永續合約，排除美股代幣與貴金屬／商品延伸商品"""
+    if not (symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol)):
+        return False
+
+    if not ONLY_CRYPTO_PERP:
+        return True
+
+    if market:
+        if market.get("swap") is False or market.get("linear") is False:
+            return False
+        category = str(market.get("category") or "").lower()
+        if any(k in category for k in ("stock", "equity", "commodity", "forex", "etf", "rwa")):
+            return False
+
+    info = {}
+    if isinstance(market, dict) and isinstance(market.get("info"), dict):
+        info.update(market["info"])
+    if isinstance(ticker, dict) and isinstance(ticker.get("info"), dict):
+        info.update(ticker["info"])
+
+    info_text = " ".join(str(v).lower() for v in info.values() if v is not None)
+    if any(k in info_text for k in ("stock", "equity", "commodity", "forex", "etf", "rwa", "xstock")):
+        return False
+
+    base = extract_base_asset(symbol)
+    if not base or not re.fullmatch(r"[A-Z0-9]{2,15}", base):
+        return False
+
+    if base in EXCLUDED_NON_CRYPTO_BASES:
+        return False
+
+    # 過濾代幣化美股常見 'X' + 大寫股票代號格式（例如 XRAM, XFLY, XSKUU, XVICR, XMSTR）
+    # 避免誤殺正常加密貨幣，只擋 'X' 開頭且長度 >= 4 的純英數代號（常見加密幣如 XRP, XMR, XLM, XTZ, XTZ 等短代號保留）
+    if base.startswith("X") and len(base) >= 4:
+        return False
+
+    for prefix in EXCLUDED_NON_CRYPTO_PREFIXES:
+        if prefix != "X" and base.startswith(prefix):
+            return False
+
+    return True
 
 
 def calculate_indicators(df):
@@ -342,7 +410,7 @@ def scan_market():
     })
 
     try:
-        exchange.load_markets()
+        markets = exchange.load_markets()
         tickers = exchange.fetch_tickers()
     except Exception as e:
         err_msg = f"❌ 取得 OKX 市場資料失敗: {e}"
@@ -354,7 +422,8 @@ def scan_market():
     candidates = []
 
     for symbol, ticker in tickers.items():
-        if not (symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol)):
+        market = markets.get(symbol)
+        if not is_crypto_perp_symbol(symbol, market=market, ticker=ticker):
             continue
 
         info = ticker.get("info") or {}
@@ -383,7 +452,7 @@ def scan_market():
     symbols = [item[0] for item in candidates[start_idx : start_idx + TOP_N_SYMBOLS]]
 
     print(
-        f"開始掃描 OKX【{mode_label}】前 {len(symbols)} 檔"
+        f"開始掃描 OKX【{mode_label}】純加密貨幣前 {len(symbols)} 檔"
         f"【雙策略 1H+15m / 15m+5m｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%｜冷卻 {COOLDOWN_BARS} 根】..."
     )
 
@@ -443,7 +512,7 @@ def scan_market():
                 take_profit = close_price - (TP_MULT * atr)
 
                 msg = (
-                    f"🚨 OKX 雙策略掃描觸發（{mode_label}）🚨\n\n"
+                    f"🚨 OKX 雙策略掃描觸發（{mode_label}・純加密）🚨\n\n"
                     f"📌 標的: {symbol}\n"
                     f"🎯 符合策略: {strat_label}\n"
                     f"📉 訊號邏輯: 大時區 MACD 防黏/即將死叉 + 小時區 EMA 死叉確認\n"
