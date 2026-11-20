@@ -14,21 +14,47 @@ TELEGRAM_CHAT_ID = (
     or "7686655302"
 )
 
-# 2. 下方大均線空間設定
-MIN_DOWNSIDE_SPACE_PCT = 1.2
+# 2. 榜單模式與掃描範圍設定
+# "MOVERS"  : 漲跌幅榜（24h 漲幅或跌幅絕對值最大）
+# "GAINERS" : 漲幅榜（24h 漲幅最高）
+# "VOLUME"  : 成交額榜（24h 成交額最高）
+SCAN_RANK_MODE = "MOVERS"
+TOP_N_SYMBOLS = 100
+SKIP_TOP_RANK_COUNT = 0
+MIN_QUOTE_VOLUME_USDT = 1_000_000  # 最低 24h 成交額門檻（過濾冷門低流動性合約，可設 0 關閉）
+
+# 想要少出現／排除的主流幣清單（可依手感自行增減）
+EXCLUDED_MAJOR_SYMBOLS = {
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "XRP/USDT:USDT",
+    "BNB/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "ADA/USDT:USDT",
+    "TRX/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "LINK/USDT:USDT",
+    "SUI/USDT:USDT",
+    "LTC/USDT:USDT",
+    "BCH/USDT:USDT",
+    "ETC/USDT:USDT",
+}
+
+MIN_DOWNSIDE_SPACE_PCT = 0.8
 
 # 3. 大時區 MACD 即將死叉與防黏設定
 ALLOW_PRE_DEAD_CROSS = True
-MAX_MACD_GAP_PCT = 0.4
+MAX_MACD_GAP_PCT = 0.5
 REQUIRE_MACD_TURNING_DOWN = True
-MIN_MACD_SPREAD_PCT = 0.08
+MIN_MACD_SPREAD_PCT = 0.05
 MACD_CHOP_LOOKBACK = 6
-MAX_MACD_CROSS_COUNT = 1
+MAX_MACD_CROSS_COUNT = 2
 
 # 4. 防黏均線 / 防洗盤過濾
-MIN_EMA_SPREAD_PCT = 0.15
-MAX_LOWER_WICK_RATIO = 0.45
-COOLDOWN_BARS = 6
+MIN_EMA_SPREAD_PCT = 0.10
+MAX_LOWER_WICK_RATIO = 0.55
+COOLDOWN_BARS = 4
 
 # 5. 雙策略開關（只保留 1H+15m 與 15m+5m）
 ENABLE_1H_15M = True
@@ -191,7 +217,6 @@ def check_major_macd_dead_cross(df):
     if any(pd.isna(v) for v in vals) or not curr['close'] or curr['close'] <= 0:
         return False
 
-    # 計算近期交叉次數（排除最新未收盤 -1，以已收盤序列計算）
     closed_df = df.iloc[:-1].copy()
     m_line = closed_df['MACD_LINE']
     s_line = closed_df['MACD_SIGNAL']
@@ -304,6 +329,20 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=180):
     return calculate_indicators(df)
 
 
+def extract_change_pct(ticker):
+    """取得 24h 漲跌幅（%），若 ticker 無 percentage 則用 last / open 推算"""
+    pct = ticker.get("percentage")
+    if pct is not None and not pd.isna(pct):
+        return float(pct)
+
+    open_p = ticker.get("open")
+    last_p = ticker.get("last")
+    if open_p and last_p and open_p > 0:
+        return ((float(last_p) - float(open_p)) / float(open_p)) * 100.0
+
+    return None
+
+
 def scan_market():
     sent_signatures = get_recent_sent_signatures(limit=100)
 
@@ -323,20 +362,41 @@ def scan_market():
         send_telegram_message(err_msg)
         return
 
-    usdt_swaps = []
-    for symbol, ticker in tickers.items():
-        if symbol.endswith('/USDT:USDT') or (
-            symbol.endswith('USDT') and ':USDT' in symbol
-        ):
-            quote_volume = ticker.get('quoteVolume', 0) or 0
-            usdt_swaps.append((symbol, quote_volume))
+    mode = SCAN_RANK_MODE.upper()
+    candidates = []
 
-    usdt_swaps.sort(key=lambda x: x[1], reverse=True)
-    symbols = [item[0] for item in usdt_swaps[:50]]
+    for symbol, ticker in tickers.items():
+        if not (symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol)):
+            continue
+        if symbol in EXCLUDED_MAJOR_SYMBOLS:
+            continue
+
+        quote_volume = float(ticker.get('quoteVolume') or 0.0)
+        if quote_volume < MIN_QUOTE_VOLUME_USDT:
+            continue
+
+        change_pct = extract_change_pct(ticker)
+        if mode in ("MOVERS", "GAINERS") and change_pct is None:
+            continue
+
+        candidates.append((symbol, quote_volume, change_pct or 0.0))
+
+    if mode == "GAINERS":
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        mode_label = "漲幅榜"
+    elif mode == "MOVERS":
+        candidates.sort(key=lambda x: abs(x[2]), reverse=True)
+        mode_label = "漲跌幅榜"
+    else:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        mode_label = "成交額榜"
+
+    start_idx = max(0, SKIP_TOP_RANK_COUNT)
+    symbols = [item[0] for item in candidates[start_idx : start_idx + TOP_N_SYMBOLS]]
 
     print(
-        f"開始掃描 OKX 前 50 大合約【雙策略 1H+15m / 15m+5m｜"
-        f"下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%｜冷卻 {COOLDOWN_BARS} 根】..."
+        f"開始掃描 OKX【{mode_label}】前 {len(symbols)} 檔（已排除 {len(EXCLUDED_MAJOR_SYMBOLS)} 檔主流幣｜"
+        f"雙策略 1H+15m / 15m+5m｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%｜冷卻 {COOLDOWN_BARS} 根）..."
     )
 
     triggered_count = 0
@@ -395,7 +455,7 @@ def scan_market():
                 take_profit = close_price - (TP_MULT * atr)
 
                 msg = (
-                    f"🚨 OKX 雙策略掃描觸發 🚨\n\n"
+                    f"🚨 OKX 雙策略掃描觸發（{mode_label}）🚨\n\n"
                     f"📌 標的: {symbol}\n"
                     f"🎯 符合策略: {strat_label}\n"
                     f"📉 訊號邏輯: 大時區 MACD 防黏/即將死叉 + 小時區 EMA 死叉確認\n"
