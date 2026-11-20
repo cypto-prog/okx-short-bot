@@ -230,9 +230,6 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=150):
 
 
 def scan_market():
-    send_telegram_message(
-        f"🔔 OKX 三策略掃描器已啟動（前 50 大｜大時區 MACD 死叉 + 小時區 EMA 7/22 死叉）..."
-    )
     sent_signatures = get_recent_sent_signatures(limit=100)
 
     exchange = ccxt.okx({
@@ -355,15 +352,10 @@ def scan_market():
             error_count += 1
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
 
-    summary = (
-        f"✅ 本輪三策略掃描完成\n"
-        f"• 掃描標的數: {len(symbols)}\n"
-        f"• 新觸發通知數: {triggered_count}\n"
-        f"• 略過重複數: {skipped_dup_count}\n"
-        f"• 錯誤筆數: {error_count}"
+    print(
+        f"掃描完成：掃描 {len(symbols)} 檔、新觸發 {triggered_count} 檔、"
+        f"略過重複 {skipped_dup_count} 檔、錯誤 {error_count} 筆。"
     )
-    print(summary)
-    send_telegram_message(summary)
 
 
 if __name__ == "__main__":
