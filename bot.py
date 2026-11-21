@@ -23,9 +23,6 @@ DEDUP_WINDOW_HOURS = 1
 DEDUP_BY_SYMBOL_ONLY = True
 
 # 3. 榜單模式與掃描範圍設定
-# "MOVERS"  : 漲跌幅榜（24h 漲幅或跌幅絕對值最大）
-# "GAINERS" : 漲幅榜（24h 漲幅最高）
-# "VOLUME"  : 成交額榜（24h 成交額最高）
 SCAN_RANK_MODE = "MOVERS"
 TOP_N_SYMBOLS = 100
 SKIP_TOP_RANK_COUNT = 0
@@ -49,7 +46,7 @@ EXCLUDED_NON_CRYPTO_PREFIXES = (
 
 MIN_DOWNSIDE_SPACE_PCT = 0.8
 
-# 5. 前方插針下探過濾（避免前面已經往下插針測試過相對低位才出空單）
+# 5. 前方插針下探過濾
 ENABLE_PRIOR_DIP_FILTER = True
 PRIOR_DIP_LOOKBACK = 6
 MAX_PRIOR_DIP_BELOW_CLOSE_PCT = 0.8
@@ -62,8 +59,10 @@ MIN_MACD_SPREAD_PCT = 0.05
 MACD_CHOP_LOOKBACK = 6
 MAX_MACD_CROSS_COUNT = 2
 
-# 7. 防黏均線 / 防洗盤過濾
-MIN_EMA_SPREAD_PCT = 0.10
+# 7. 防黏均線 / 近期死叉 / 防洗盤過濾
+MIN_EMA_SPREAD_PCT = 0.25         # 紫黃均線最小開口 %（提高避免太黏）
+MIN_PRICE_BELOW_EMA7_PCT = 0.15   # 收盤價需低於 EMA7 至少此 %（避免 K 棒貼著均線）
+MAX_RECENT_CROSS_AGE_BARS = 2     # 死叉需發生在最近幾根已收盤 K 棒內（避免抓舊死叉）
 MAX_LOWER_WICK_RATIO = 0.55
 COOLDOWN_BARS = 4
 
@@ -84,7 +83,6 @@ def make_dedup_key(symbol, strat_label):
 
 
 def load_sent_history():
-    """讀取已發送訊號紀錄，並自動清掉超過 DEDUP_WINDOW_HOURS 的舊紀錄"""
     now_ts = time.time()
     max_age_sec = max(0.0, float(DEDUP_WINDOW_HOURS)) * 3600.0
     history = {}
@@ -108,7 +106,6 @@ def load_sent_history():
 
 
 def save_sent_history(history):
-    """儲存已發送訊號紀錄到 JSON 檔"""
     try:
         with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
@@ -305,6 +302,15 @@ def check_major_macd_dead_cross(df):
 
 
 def check_minor_ema_dead_cross(df):
+    """
+    小時區做空條件：
+    1. 大級別藍線 (EMA_85) 在橘線 (EMA_120) 上方（多頭背景）
+    2. 死叉發生在最近 MAX_RECENT_CROSS_AGE_BARS 根已收盤 K 棒內（不抓太舊的死叉）
+    3. 目前仍處於 EMA_7 < EMA_22，且收盤價明顯低於 EMA_7（不貼均線）
+    4. 紫黃均線開口 >= MIN_EMA_SPREAD_PCT
+    5. 下影線比例 <= MAX_LOWER_WICK_RATIO，且近期無明顯往下插針
+    6. 距離上次符合訊號已達 COOLDOWN_BARS 根 K 棒
+    """
     if df is None or len(df) < 10:
         return False, None
 
@@ -326,14 +332,14 @@ def check_minor_ema_dead_cross(df):
     cross_down_series = (e7_prev >= e22_prev) & (e7 < e22)
     cross_up_series = (e7_prev <= e22_prev) & (e7 > e22)
 
-    has_crossed_down = False
+    last_cross_down_idx = None
     last_signal_idx = None
 
     for i in range(len(closed_df)):
         if bool(cross_up_series.iloc[i]):
-            has_crossed_down = False
+            last_cross_down_idx = None
         if bool(cross_down_series.iloc[i]):
-            has_crossed_down = True
+            last_cross_down_idx = i
 
         bar_i = closed_df.iloc[i]
         if any(pd.isna(bar_i[k]) for k in ['EMA_7', 'EMA_22', 'EMA_85', 'EMA_120', 'close', 'open', 'high', 'low']):
@@ -341,8 +347,16 @@ def check_minor_ema_dead_cross(df):
         if not is_bullish_major_trend(bar_i) or bar_i['close'] <= 0:
             continue
 
+        fresh_cross_ok = (
+            last_cross_down_idx is not None
+            and ((i - last_cross_down_idx) < max(1, MAX_RECENT_CROSS_AGE_BARS))
+        )
+
         spread_pct = (abs(bar_i['EMA_7'] - bar_i['EMA_22']) / bar_i['close']) * 100.0
         spread_ok = spread_pct >= MIN_EMA_SPREAD_PCT
+
+        below_ema7_pct = ((bar_i['EMA_7'] - bar_i['close']) / bar_i['close']) * 100.0
+        not_stuck_ok = (below_ema7_pct >= MIN_PRICE_BELOW_EMA7_PCT) and (bar_i['close'] < bar_i['EMA_22'])
 
         bar_range = bar_i['high'] - bar_i['low']
         lower_wick = min(bar_i['open'], bar_i['close']) - bar_i['low']
@@ -352,10 +366,9 @@ def check_minor_ema_dead_cross(df):
         no_prior_dip = not has_prior_down_wick_dip(closed_df, i)
 
         cond_i = (
-            has_crossed_down
+            fresh_cross_ok
             and (bar_i['EMA_7'] < bar_i['EMA_22'])
-            and (bar_i['close'] < bar_i['EMA_7'])
-            and (bar_i['close'] < bar_i['EMA_22'])
+            and not_stuck_ok
             and spread_ok
             and wick_ok
             and no_prior_dip
