@@ -1,6 +1,8 @@
+import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 import ccxt
 import pandas as pd
 import requests
@@ -15,7 +17,12 @@ TELEGRAM_CHAT_ID = (
     or "7686655302"
 )
 
-# 2. 榜單模式與掃描範圍設定
+# 2. 防重複推播設定（「一樣的單報一次就好」）
+STATE_FILE_PATH = "sent_signals.json"
+DEDUP_WINDOW_HOURS = 12       # 同一張單在幾小時內不再重複報（可依需求調整，例如 6 / 12 / 24）
+DEDUP_BY_SYMBOL_ONLY = True   # True: 同一檔標的在時間窗內只報一次；False: 同一檔標的+同一策略組合才算重複
+
+# 3. 榜單模式與掃描範圍設定
 # "MOVERS"  : 漲跌幅榜（24h 漲幅或跌幅絕對值最大）
 # "GAINERS" : 漲幅榜（24h 漲幅最高）
 # "VOLUME"  : 成交額榜（24h 成交額最高）
@@ -24,26 +31,25 @@ TOP_N_SYMBOLS = 100
 SKIP_TOP_RANK_COUNT = 0
 MIN_QUOTE_VOLUME_USDT = 1_000_000  # 最低 24h 成交額門檻（若抓不到或想掃更多可設 0）
 
-# 3. 排除美股代幣、貴金屬／商品等非加密貨幣延伸商品
+# 4. 排除美股代幣、槓桿 ETF、貴金屬／商品等非加密貨幣延伸商品
 ONLY_CRYPTO_PERP = True
 
-# 明確排除的非加密貨幣代號（大寫 base 幣種）
 EXCLUDED_NON_CRYPTO_BASES = {
     "XAU", "XAG", "XPT", "XPD",
     "WTI", "BRENT", "USOIL", "UKOIL", "NG", "NATGAS",
     "COPPER", "ALUMINUM", "NICKEL", "ZINC", "LEAD",
     "CORN", "WHEAT", "SOYBEAN", "COFFEE", "SUGAR", "COTTON",
     "SPX", "NDX", "DJI", "QQQ", "SPY", "NVDA", "TSLA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "MSTR",
+    "SOXS", "SOXL", "TQQQ", "SQQQ", "UVXY", "SPXU", "UPRO",
 }
 
-# 常見代幣化美股／股票延伸商品前綴（例如 xRAM, xFLY, xSKUU, xVICR, xMSTR）
 EXCLUDED_NON_CRYPTO_PREFIXES = (
     "X",
 )
 
 MIN_DOWNSIDE_SPACE_PCT = 0.8
 
-# 4. 大時區 MACD 即將死叉與防黏設定
+# 5. 大時區 MACD 即將死叉與防黏設定
 ALLOW_PRE_DEAD_CROSS = True
 MAX_MACD_GAP_PCT = 0.5
 REQUIRE_MACD_TURNING_DOWN = True
@@ -51,19 +57,58 @@ MIN_MACD_SPREAD_PCT = 0.05
 MACD_CHOP_LOOKBACK = 6
 MAX_MACD_CROSS_COUNT = 2
 
-# 5. 防黏均線 / 防洗盤過濾
+# 6. 防黏均線 / 防洗盤過濾
 MIN_EMA_SPREAD_PCT = 0.10
 MAX_LOWER_WICK_RATIO = 0.55
 COOLDOWN_BARS = 4
 
-# 6. 雙策略開關（只保留 1H+15m 與 15m+5m）
+# 7. 雙策略開關（只保留 1H+15m 與 15m+5m）
 ENABLE_1H_15M = True
 ENABLE_15M_5M = True
 
-# 7. ATR 風控設定
+# 8. ATR 風控設定
 ATR_LEN = 14
 SL_MULT = 1.15
 TP_MULT = 1.6
+
+
+def make_dedup_key(symbol, strat_label):
+    if DEDUP_BY_SYMBOL_ONLY:
+        return symbol.strip()
+    return f"{symbol.strip()}|{strat_label.strip()}"
+
+
+def load_sent_history():
+    """讀取已發送訊號紀錄，並自動清掉超過 DEDUP_WINDOW_HOURS 的舊紀錄"""
+    now_ts = time.time()
+    max_age_sec = max(0.0, float(DEDUP_WINDOW_HOURS)) * 3600.0
+    history = {}
+
+    if os.path.exists(STATE_FILE_PATH):
+        try:
+            with open(STATE_FILE_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for key, ts in raw.items():
+                    try:
+                        ts_val = float(ts)
+                        if max_age_sec == 0 or (now_ts - ts_val) <= max_age_sec:
+                            history[str(key)] = ts_val
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as e:
+            print(f"讀取 {STATE_FILE_PATH} 發生錯誤，使用空紀錄: {e}")
+
+    return history
+
+
+def save_sent_history(history):
+    """儲存已發送訊號紀錄到 JSON 檔"""
+    try:
+        with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"寫入 {STATE_FILE_PATH} 發生錯誤: {e}")
 
 
 def send_telegram_message(message):
@@ -90,52 +135,6 @@ def send_telegram_message(message):
         return False
 
 
-def get_recent_sent_signatures(limit=100):
-    """從近期 Telegram 訊息紀錄讀取已發送過的訊號簽章，避免重複推播"""
-    seen = set()
-    if not TELEGRAM_BOT_TOKEN:
-        return seen
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"limit": limit}
-
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code != 200:
-            return seen
-
-        data = response.json()
-        for item in data.get("result", []):
-            msg_obj = (
-                item.get("message")
-                or item.get("channel_post")
-                or {}
-            )
-            chat_id = str(msg_obj.get("chat", {}).get("id", ""))
-            if chat_id and chat_id != str(TELEGRAM_CHAT_ID):
-                continue
-
-            text = msg_obj.get("text", "")
-            if "OKX 雙策略掃描觸發" not in text and "OKX 三策略掃描觸發" not in text:
-                continue
-
-            symbol_line = ""
-            strat_line = ""
-            for line in text.splitlines():
-                if "標的:" in line:
-                    symbol_line = line.split("標的:", 1)[1].strip()
-                elif "符合策略:" in line:
-                    strat_line = line.split("符合策略:", 1)[1].strip()
-
-            if symbol_line and strat_line:
-                seen.add(f"{symbol_line}|{strat_line}")
-
-    except Exception as e:
-        print(f"讀取歷史訊號紀錄時略過錯誤: {e}")
-
-    return seen
-
-
 def extract_base_asset(symbol):
     """從合約代號取出基礎幣種（例如 'PIPPIN/USDT:USDT' -> 'PIPPIN'）"""
     base_part = symbol.split("/", 1)[0] if "/" in symbol else symbol.split("-", 1)[0]
@@ -143,7 +142,7 @@ def extract_base_asset(symbol):
 
 
 def is_crypto_perp_symbol(symbol, market=None, ticker=None):
-    """判斷是否為一般加密貨幣 USDT 永續合約，排除美股代幣與貴金屬／商品延伸商品"""
+    """判斷是否為一般加密貨幣 USDT 永續合約，排除美股代幣、槓桿 ETF 與貴金屬／商品延伸商品"""
     if not (symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol)):
         return False
 
@@ -174,8 +173,6 @@ def is_crypto_perp_symbol(symbol, market=None, ticker=None):
     if base in EXCLUDED_NON_CRYPTO_BASES:
         return False
 
-    # 過濾代幣化美股常見 'X' + 大寫股票代號格式（例如 XRAM, XFLY, XSKUU, XVICR, XMSTR）
-    # 避免誤殺正常加密貨幣，只擋 'X' 開頭且長度 >= 4 的純英數代號（常見加密幣如 XRP, XMR, XLM, XTZ, XTZ 等短代號保留）
     if base.startswith("X") and len(base) >= 4:
         return False
 
@@ -187,20 +184,17 @@ def is_crypto_perp_symbol(symbol, market=None, ticker=None):
 
 
 def calculate_indicators(df):
-    # 紫線: EMA_7 | 黃線: EMA_22 | 藍線: EMA_85 | 橘線: EMA_120
     df['EMA_7'] = df['close'].ewm(span=7, adjust=False).mean()
     df['EMA_22'] = df['close'].ewm(span=22, adjust=False).mean()
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    # MACD (12, 26, 9)
     ema_12 = df['close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['close'].ewm(span=26, adjust=False).mean()
     df['MACD_LINE'] = ema_12 - ema_26
     df['MACD_SIGNAL'] = df['MACD_LINE'].ewm(span=9, adjust=False).mean()
     df['MACD_HIST'] = df['MACD_LINE'] - df['MACD_SIGNAL']
 
-    # ATR
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -400,7 +394,7 @@ def extract_change_pct(ticker):
 
 
 def scan_market():
-    sent_signatures = get_recent_sent_signatures(limit=100)
+    sent_history = load_sent_history()
 
     exchange = ccxt.okx({
         'enableRateLimit': True,
@@ -453,7 +447,7 @@ def scan_market():
 
     print(
         f"開始掃描 OKX【{mode_label}】純加密貨幣前 {len(symbols)} 檔"
-        f"【雙策略 1H+15m / 15m+5m｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%｜冷卻 {COOLDOWN_BARS} 根】..."
+        f"【雙策略 1H+15m / 15m+5m｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%｜去重 {DEDUP_WINDOW_HOURS}h】..."
     )
 
     triggered_count = 0
@@ -500,16 +494,17 @@ def scan_market():
                     continue
 
                 strat_label = ', '.join(matched_strategies)
-                signature = f"{symbol}|{strat_label}"
+                dedup_key = make_dedup_key(symbol, strat_label)
 
-                if signature in sent_signatures:
+                if dedup_key in sent_history:
                     skipped_dup_count += 1
-                    print(f"略過重複訊號: {symbol} [{strat_label}]")
+                    print(f"略過 {DEDUP_WINDOW_HOURS} 小時內已報過標的: {symbol} [{strat_label}]")
                     continue
 
                 triggered_count += 1
                 stop_loss = close_price + (SL_MULT * atr)
                 take_profit = close_price - (TP_MULT * atr)
+                now_str = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
 
                 msg = (
                     f"🚨 OKX 雙策略掃描觸發（{mode_label}・純加密）🚨\n\n"
@@ -519,11 +514,12 @@ def scan_market():
                     f"📊 下方大均線空間: {ref_space_pct:.2f}%\n"
                     f"💰 收盤價: {close_price}\n"
                     f"🛑 建議止損 (SL): {stop_loss:.4f} ({SL_MULT}x ATR)\n"
-                    f"🎯 建議指盈 (TP): {take_profit:.4f} ({TP_MULT}x ATR)"
+                    f"🎯 建議指盈 (TP): {take_profit:.4f} ({TP_MULT}x ATR)\n"
+                    f"🕒 觸發時間: {now_str}"
                 )
 
                 if send_telegram_message(msg):
-                    sent_signatures.add(signature)
+                    sent_history[dedup_key] = time.time()
                 print(f"發現符合標的: {symbol} [{strat_label}] 空間={ref_space_pct:.2f}%")
 
             time.sleep(0.15)
@@ -531,6 +527,8 @@ def scan_market():
         except Exception as e:
             error_count += 1
             print(f"處理標的 {symbol} 時發生錯誤: {e}")
+
+    save_sent_history(sent_history)
 
     print(
         f"掃描完成：掃描 {len(symbols)} 檔、新觸發 {triggered_count} 檔、"
