@@ -51,8 +51,8 @@ MIN_DOWNSIDE_SPACE_PCT = 0.8
 
 # 5. 前方插針下探過濾（避免前面已經往下插針測試過相對低位才出空單）
 ENABLE_PRIOR_DIP_FILTER = True
-PRIOR_DIP_LOOKBACK = 6              # 檢查最近幾根已收盤 K 棒（含當根）
-MAX_PRIOR_DIP_BELOW_CLOSE_PCT = 0.8 # 最近 K 棒最低點若低於現價超過此 %，視為前面已插針下探
+PRIOR_DIP_LOOKBACK = 6
+MAX_PRIOR_DIP_BELOW_CLOSE_PCT = 0.8
 
 # 6. 大時區 MACD 即將死叉與防黏設定
 ALLOW_PRE_DEAD_CROSS = True
@@ -141,13 +141,11 @@ def send_telegram_message(message):
 
 
 def extract_base_asset(symbol):
-    """從合約代號取出基礎幣種（例如 'PIPPIN/USDT:USDT' -> 'PIPPIN'）"""
     base_part = symbol.split("/", 1)[0] if "/" in symbol else symbol.split("-", 1)[0]
     return base_part.strip().upper()
 
 
 def is_crypto_perp_symbol(symbol, market=None, ticker=None):
-    """判斷是否為一般加密貨幣 USDT 永續合約，排除美股代幣、槓桿 ETF 與貴金屬／商品延伸商品"""
     if not (symbol.endswith('/USDT:USDT') or (symbol.endswith('USDT') and ':USDT' in symbol)):
         return False
 
@@ -194,10 +192,11 @@ def calculate_indicators(df):
     df['EMA_85'] = df['close'].ewm(span=85, adjust=False).mean()
     df['EMA_120'] = df['close'].ewm(span=120, adjust=False).mean()
 
-    ema_12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema_26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD_LINE'] = ema_12 - ema_26
-    df['MACD_SIGNAL'] = df['MACD_LINE'].ewm(span=9, adjust=False).mean()
+    # MACD (10, 20, 7)
+    ema_10 = df['close'].ewm(span=10, adjust=False).mean()
+    ema_20 = df['close'].ewm(span=20, adjust=False).mean()
+    df['MACD_LINE'] = ema_10 - ema_20
+    df['MACD_SIGNAL'] = df['MACD_LINE'].ewm(span=7, adjust=False).mean()
     df['MACD_HIST'] = df['MACD_LINE'] - df['MACD_SIGNAL']
 
     high_low = df['high'] - df['low']
@@ -212,7 +211,6 @@ def calculate_indicators(df):
 
 
 def is_bullish_major_trend(bar):
-    """大級別多頭條件：藍線 (EMA_85) 在橘線 (EMA_120) 上方"""
     if bar is None:
         return False
     if pd.isna(bar['EMA_85']) or pd.isna(bar['EMA_120']):
@@ -221,7 +219,6 @@ def is_bullish_major_trend(bar):
 
 
 def get_downside_space_pct(bar):
-    """計算剛收盤 K 棒距離下方大級別均線 (藍線 EMA_85 / 橘線 EMA_120) 的下跌空間百分比"""
     if bar is None:
         return None
     price = bar['close']
@@ -239,7 +236,6 @@ def get_downside_space_pct(bar):
 
 
 def has_enough_downside_space(bar, min_pct=MIN_DOWNSIDE_SPACE_PCT):
-    """做空前提：K 棒距離下方大級別均線還有足夠空間"""
     space_pct = get_downside_space_pct(bar)
     if space_pct is None:
         return False, None
@@ -247,10 +243,6 @@ def has_enough_downside_space(bar, min_pct=MIN_DOWNSIDE_SPACE_PCT):
 
 
 def has_prior_down_wick_dip(closed_df, idx):
-    """
-    檢查包含 idx 在內的最近 PRIOR_DIP_LOOKBACK 根已收盤 K 棒，
-    是否已經往下插針跌到低於目前收盤價超過 MAX_PRIOR_DIP_BELOW_CLOSE_PCT%。
-    """
     if not ENABLE_PRIOR_DIP_FILTER:
         return False
 
@@ -270,12 +262,6 @@ def has_prior_down_wick_dip(closed_df, idx):
 
 
 def check_major_macd_dead_cross(df):
-    """
-    大時區 MACD 條件：
-    1. 已死叉 或 即將死叉（準備交叉）
-    2. 快慢線差距 >= MIN_MACD_SPREAD_PCT（避免太黏）
-    3. 近 MACD_CHOP_LOOKBACK 根 K 棒內交叉次數 <= MAX_MACD_CROSS_COUNT（避免反覆糾纏）
-    """
     if df is None or len(df) < max(MACD_CHOP_LOOKBACK + 4, 8):
         return False
 
@@ -319,15 +305,6 @@ def check_major_macd_dead_cross(df):
 
 
 def check_minor_ema_dead_cross(df):
-    """
-    小時區做空條件：
-    1. 大級別藍線 (EMA_85) 在橘線 (EMA_120) 上方（多頭背景）
-    2. 紫線 (EMA_7) 下穿黃線 (EMA_22) 死叉確認，且目前仍處於死叉狀態並收在兩條均線下方
-    3. 紫黃均線開口 >= MIN_EMA_SPREAD_PCT（避免黏在一起）
-    4. 下影線比例 <= MAX_LOWER_WICK_RATIO（避免洗盤下影針）
-    5. 近期未出現明顯往下插針探底（避免前面已插針測試下方價格）
-    6. 距離上次符合訊號已達 COOLDOWN_BARS 根 K 棒
-    """
     if df is None or len(df) < 10:
         return False, None
 
@@ -406,7 +383,6 @@ def fetch_tf_df(exchange, symbol, timeframe, limit=180):
 
 
 def extract_change_pct(ticker):
-    """取得 24h 漲跌幅（%），依序嘗試 percentage、open/last 與 OKX info 原始欄位"""
     pct = ticker.get("percentage")
     if pct is not None and not pd.isna(pct):
         return float(pct)
@@ -479,7 +455,7 @@ def scan_market():
 
     print(
         f"開始掃描 OKX【{mode_label}】純加密貨幣前 {len(symbols)} 檔"
-        f"【雙策略 1H+15m / 15m+5m｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%｜去重 {DEDUP_WINDOW_HOURS}h】..."
+        f"【雙策略 1H+15m / 15m+5m｜MACD(10,20,7)｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
     )
 
     triggered_count = 0
@@ -552,6 +528,7 @@ def scan_market():
 
                 if send_telegram_message(msg):
                     sent_history[dedup_key] = time.time()
+                    save_sent_history(sent_history)
                 print(f"發現符合標的: {symbol} [{strat_label}] 空間={ref_space_pct:.2f}%")
 
             time.sleep(0.15)
