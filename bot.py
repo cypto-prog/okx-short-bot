@@ -19,8 +19,8 @@ TELEGRAM_CHAT_ID = (
 
 # 2. 防重複推播設定（「一樣的單報一次就好」）
 STATE_FILE_PATH = "sent_signals.json"
-DEDUP_WINDOW_HOURS = 12       # 同一張單在幾小時內不再重複報（可依需求調整，例如 6 / 12 / 24）
-DEDUP_BY_SYMBOL_ONLY = True   # True: 同一檔標的在時間窗內只報一次；False: 同一檔標的+同一策略組合才算重複
+DEDUP_WINDOW_HOURS = 12
+DEDUP_BY_SYMBOL_ONLY = True
 
 # 3. 榜單模式與掃描範圍設定
 # "MOVERS"  : 漲跌幅榜（24h 漲幅或跌幅絕對值最大）
@@ -29,7 +29,7 @@ DEDUP_BY_SYMBOL_ONLY = True   # True: 同一檔標的在時間窗內只報一次
 SCAN_RANK_MODE = "MOVERS"
 TOP_N_SYMBOLS = 100
 SKIP_TOP_RANK_COUNT = 0
-MIN_QUOTE_VOLUME_USDT = 1_000_000  # 最低 24h 成交額門檻（若抓不到或想掃更多可設 0）
+MIN_QUOTE_VOLUME_USDT = 1_000_000
 
 # 4. 排除美股代幣、槓桿 ETF、貴金屬／商品等非加密貨幣延伸商品
 ONLY_CRYPTO_PERP = True
@@ -49,7 +49,12 @@ EXCLUDED_NON_CRYPTO_PREFIXES = (
 
 MIN_DOWNSIDE_SPACE_PCT = 0.8
 
-# 5. 大時區 MACD 即將死叉與防黏設定
+# 5. 前方插針下探過濾（避免前面已經往下插針測試過相對低位才出空單）
+ENABLE_PRIOR_DIP_FILTER = True
+PRIOR_DIP_LOOKBACK = 6              # 檢查最近幾根已收盤 K 棒（含當根）
+MAX_PRIOR_DIP_BELOW_CLOSE_PCT = 0.8 # 最近 K 棒最低點若低於現價超過此 %，視為前面已插針下探
+
+# 6. 大時區 MACD 即將死叉與防黏設定
 ALLOW_PRE_DEAD_CROSS = True
 MAX_MACD_GAP_PCT = 0.5
 REQUIRE_MACD_TURNING_DOWN = True
@@ -57,16 +62,16 @@ MIN_MACD_SPREAD_PCT = 0.05
 MACD_CHOP_LOOKBACK = 6
 MAX_MACD_CROSS_COUNT = 2
 
-# 6. 防黏均線 / 防洗盤過濾
+# 7. 防黏均線 / 防洗盤過濾
 MIN_EMA_SPREAD_PCT = 0.10
 MAX_LOWER_WICK_RATIO = 0.55
 COOLDOWN_BARS = 4
 
-# 7. 雙策略開關（只保留 1H+15m 與 15m+5m）
+# 8. 雙策略開關（只保留 1H+15m 與 15m+5m）
 ENABLE_1H_15M = True
 ENABLE_15M_5M = True
 
-# 8. ATR 風控設定
+# 9. ATR 風控設定
 ATR_LEN = 14
 SL_MULT = 1.15
 TP_MULT = 1.6
@@ -241,6 +246,29 @@ def has_enough_downside_space(bar, min_pct=MIN_DOWNSIDE_SPACE_PCT):
     return bool(space_pct >= min_pct), space_pct
 
 
+def has_prior_down_wick_dip(closed_df, idx):
+    """
+    檢查包含 idx 在內的最近 PRIOR_DIP_LOOKBACK 根已收盤 K 棒，
+    是否已經往下插針跌到低於目前收盤價超過 MAX_PRIOR_DIP_BELOW_CLOSE_PCT%。
+    """
+    if not ENABLE_PRIOR_DIP_FILTER:
+        return False
+
+    curr_bar = closed_df.iloc[idx]
+    curr_close = curr_bar['close']
+    if pd.isna(curr_close) or curr_close <= 0:
+        return False
+
+    start_idx = max(0, idx - max(1, PRIOR_DIP_LOOKBACK) + 1)
+    recent_lows = closed_df.iloc[start_idx : idx + 1]['low'].dropna()
+    if recent_lows.empty:
+        return False
+
+    recent_min_low = float(recent_lows.min())
+    dip_below_close_pct = ((curr_close - recent_min_low) / curr_close) * 100.0
+    return bool(dip_below_close_pct >= MAX_PRIOR_DIP_BELOW_CLOSE_PCT)
+
+
 def check_major_macd_dead_cross(df):
     """
     大時區 MACD 條件：
@@ -297,7 +325,8 @@ def check_minor_ema_dead_cross(df):
     2. 紫線 (EMA_7) 下穿黃線 (EMA_22) 死叉確認，且目前仍處於死叉狀態並收在兩條均線下方
     3. 紫黃均線開口 >= MIN_EMA_SPREAD_PCT（避免黏在一起）
     4. 下影線比例 <= MAX_LOWER_WICK_RATIO（避免洗盤下影針）
-    5. 距離上次符合訊號已達 COOLDOWN_BARS 根 K 棒
+    5. 近期未出現明顯往下插針探底（避免前面已插針測試下方價格）
+    6. 距離上次符合訊號已達 COOLDOWN_BARS 根 K 棒
     """
     if df is None or len(df) < 10:
         return False, None
@@ -343,6 +372,8 @@ def check_minor_ema_dead_cross(df):
         wick_ratio = (lower_wick / bar_range) if bar_range > 0 else 0.0
         wick_ok = wick_ratio <= MAX_LOWER_WICK_RATIO
 
+        no_prior_dip = not has_prior_down_wick_dip(closed_df, i)
+
         cond_i = (
             has_crossed_down
             and (bar_i['EMA_7'] < bar_i['EMA_22'])
@@ -350,6 +381,7 @@ def check_minor_ema_dead_cross(df):
             and (bar_i['close'] < bar_i['EMA_22'])
             and spread_ok
             and wick_ok
+            and no_prior_dip
         )
 
         cooldown_ok = (last_signal_idx is None) or ((i - last_signal_idx) >= COOLDOWN_BARS)
