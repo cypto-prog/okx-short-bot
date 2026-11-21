@@ -17,9 +17,9 @@ TELEGRAM_CHAT_ID = (
     or "7686655302"
 )
 
-# 2. 防重複推播設定（「一樣的單報一次就好」）
+# 2. 防重複推播設定（同一隻幣種 1 小時內只報一次）
 STATE_FILE_PATH = "sent_signals.json"
-DEDUP_WINDOW_HOURS = 12
+DEDUP_WINDOW_HOURS = 1
 DEDUP_BY_SYMBOL_ONLY = True
 
 # 3. 榜單模式與掃描範圍設定
@@ -455,7 +455,7 @@ def scan_market():
 
     print(
         f"開始掃描 OKX【{mode_label}】純加密貨幣前 {len(symbols)} 檔"
-        f"【雙策略 1H+15m / 15m+5m｜MACD(10,20,7)｜下方空間 >= {MIN_DOWNSIDE_SPACE_PCT}%】..."
+        f"【雙策略 1H+15m / 15m+5m｜MACD(10,20,7)｜去重 {DEDUP_WINDOW_HOURS}h】..."
     )
 
     triggered_count = 0
